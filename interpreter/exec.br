@@ -1359,7 +1359,7 @@ def Value call_value(mut Interpreter interp, Value callee, [Value] args):
                             let last_idx = ctor_args.length - 1
                             match ctor_args[last_idx]:
                                 Value.Closure(_, body, captured):
-                                    ctor_args[last_idx] = Value.Array(collect_array_block(interp, body, captured))
+                                    ctor_args[last_idx] = Value.Labeled(last_field.name, Value.Array(collect_array_block(interp, body, captured)))
                                 _: nil
                         _: nil
                 instantiate_struct(interp, decl, ctor_args)

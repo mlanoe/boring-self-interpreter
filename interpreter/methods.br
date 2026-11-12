@@ -586,6 +586,272 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
             nil
         _: nil
 
+# ─── `view` runtime methods ───────────────────────────────────────────────────
+#
+# The Rust lowering (src/lower_view.rs) generates these for every `view`; here they are answered
+# natively for any object whose struct carries the `view` attribute (`[state struct, env struct]`).
+
+def string? view_state_name(StructDecl decl):
+    for a in decl.attrs:
+        if a.name == "view" and a.args.length >= 1:
+            if a.args[0] != "":
+                return a.args[0]
+    nil
+
+def string? view_env_name(StructDecl decl):
+    for a in decl.attrs:
+        if a.name == "view" and a.args.length >= 2:
+            if a.args[1] != "":
+                return a.args[1]
+    nil
+
+def bool decl_is_view(StructDecl decl):
+    attrs_have(decl.attrs, "view")
+
+def bool view_is_composite(StructDecl decl):
+    for m in decl.methods:
+        if m.name == "body" and m.body.length > 0:
+            return true
+    false
+
+# The mounted state a view starts from: its `V__State` seeded with the description's own
+# `state` arguments (`Counter(count = 10)`), the declaration's defaults otherwise.
+def Value view_make_state(mut Interpreter interp, ObjectInner'actor inner, StructDecl decl, bool seeded):
+    guard let state_name = view_state_name(decl) else:
+        if let nodecl = interp.get_struct_decl("NoState"):
+            return instantiate_struct(interp, nodecl, [])
+        return Value.Object(ObjectInner(type_name= "NoState", fields= []))
+    guard let sdecl = interp.get_struct_decl(state_name) else: return Value.Nil
+    mut [Value] seed_args = []
+    if seeded:
+        for f in inner.fields:
+            if f.0.starts_with("__seed_"):
+                seed_args.push(Value.Labeled(f.0.slice(7, f.0.length), f.1))
+    instantiate_struct(interp, sdecl, seed_args)
+
+def string view_lower_first(string name):
+    if name.length == 0:
+        return name
+    let string head = name.slice(0, 1)
+    let string tail = name.slice(1, name.length)
+    var out = head
+    if ord(head) >= 65 and ord(head) <= 90:
+        out = chr(ord(head) + 32)
+    "{out}{tail}"
+
+# `Text("x").padding(10.0)` is `Padding(insets = 10.0, children = [Text("x")])`: a modifier is
+# any view with a `[View] children` field, named like its lowercase-first method.
+def Value? view_modifier_call(mut Interpreter interp, Value recv, string method_name, [Value] args):
+    mut [string] names = []
+    for k in interp.struct_decls.keys():
+        names.push(k)
+    for vname in names:
+        if view_lower_first(vname) != method_name:
+            continue
+        guard let mdecl = interp.get_struct_decl(vname) else: continue
+        if not decl_is_view(mdecl):
+            continue
+        var has_children = false
+        mut [string] inputs = []
+        for f in mdecl.fields:
+            if f.name == "children":
+                has_children = true
+            else:
+                inputs.push(f.name)
+        if not has_children:
+            continue
+        mut [Value] ctor_args = []
+        var positional = 0
+        for a in args:
+            match a:
+                Value.Labeled(_, _): ctor_args.push(a)
+                _:
+                    if positional < inputs.length:
+                        ctor_args.push(Value.Labeled(inputs[positional], a))
+                    positional = positional + 1
+        ctor_args.push(Value.Labeled("children", Value.Array([recv])))
+        return instantiate_struct(interp, mdecl, ctor_args)
+    nil
+
+def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInner'actor inner, StructDecl decl, string method_name, [Value] args):
+    if method_name == "viewKind":
+        return Value.Str(decl.name)
+    if method_name == "viewChildren":
+        if let c = inner.get_field("children"):
+            return c
+        return Value.Array([])
+    if method_name == "viewKey":
+        if let k = inner.get_field("key"):
+            return k
+        return Value.Str("")
+    if method_name == "viewSite":
+        if let s = inner.get_field("site"):
+            return s
+        return Value.Int(-1)
+    if method_name == "isComposite":
+        return Value.Bool(view_is_composite(decl))
+    if method_name == "usesEnv":
+        if let _ = view_env_name(decl):
+            return Value.Bool(true)
+        return Value.Bool(false)
+    if method_name == "viewProvides":
+        if decl.name == "Provide":
+            if let v = inner.get_field("value"):
+                return v
+        return Value.Nil
+    if method_name == "viewProps":
+        mut [(Value, Value)] props = []
+        for f in decl.fields:
+            if f.name == "children":
+                continue
+            if let fv = inner.get_field(f.name):
+                match fv:
+                    Value.Nil: nil
+                    Value.Array(_): nil
+                    Value.Dict(_): nil
+                    Value.Object(_): nil
+                    Value.Closure(_, _, _): nil
+                    Value.Fn(_, _): nil
+                    _: props.push((Value.Str(f.name), Value.Str(display_value(interp, fv))))
+        return Value.Dict(props)
+    if method_name == "newState" or method_name == "newOwnedState":
+        return view_make_state(interp, inner, decl, false)
+    if method_name == "seededState":
+        return view_make_state(interp, inner, decl, true)
+    if method_name == "viewHandles":
+        var hact = ""
+        if args.length > 0:
+            match args[0]:
+                Value.Str(hs): hact = hs
+                _: nil
+        if hact == "submit":
+            if let hh = inner.get_field("onSubmit"):
+                match hh:
+                    Value.Nil: return Value.Bool(false)
+                    _: return Value.Bool(true)
+        if hact == "move":
+            if let hm = inner.get_field("onMove"):
+                match hm:
+                    Value.Nil: return Value.Bool(false)
+                    _: return Value.Bool(true)
+        if hact == "delete":
+            if let hd = inner.get_field("onDelete"):
+                match hd:
+                    Value.Nil: return Value.Bool(false)
+                    _: return Value.Bool(true)
+        if hact == "dismiss" or hact == "select" or hact == "setSelection":
+            return Value.Bool(true)
+        return Value.Bool(false)
+    if method_name == "viewTask":
+        if let ht = inner.get_field("onTask"):
+            call_value(interp, ht, args)
+        return Value.Void
+    if method_name == "viewAct":
+        var action = ""
+        var act_arg = ""
+        if args.length > 0:
+            match args[0]:
+                Value.Str(a0): action = a0
+                _: nil
+        if args.length > 1:
+            match args[1]:
+                Value.Str(a1): act_arg = a1
+                _: nil
+        # The handler fields a native control carries, by the action that runs them.
+        var handler_field = ""
+        if action == "activate":
+            handler_field = "onActivate"
+        elif action == "submit":
+            handler_field = "onSubmit"
+        elif action == "mount":
+            handler_field = "onMount"
+        elif action == "unmount":
+            handler_field = "onUnmount"
+        if handler_field != "":
+            if let hv = inner.get_field(handler_field):
+                match hv:
+                    Value.Nil: nil
+                    _: call_value(interp, hv, [])
+            return Value.Void
+        # Writes through a bound `value` slot: toggle / setBool / setText / setFloat.
+        if action == "toggle" or action == "setBool" or action == "setText" or action == "setFloat":
+            if let sv = inner.get_field("value"):
+                match sv:
+                    Value.Object(slot):
+                        if action == "toggle":
+                            if let cur = slot.get_field("value"):
+                                match cur:
+                                    Value.Bool(cb): slot.set_field("value", Value.Bool(not cb))
+                                    _: nil
+                        elif action == "setBool":
+                            slot.set_field("value", Value.Bool(act_arg == "true"))
+                        elif action == "setText":
+                            slot.set_field("value", Value.Str(act_arg))
+                        else:
+                            let parsed = act_arg.parse_float()
+                            if let pf = parsed:
+                                slot.set_field("value", Value.Float64(pf))
+                    _: nil
+            return Value.Void
+        if action == "dismiss":
+            if let dv = inner.get_field("isPresented"):
+                match dv:
+                    Value.Object(dslot): dslot.set_field("value", Value.Bool(false))
+                    _: nil
+            return Value.Void
+        if action == "select":
+            if let sel = inner.get_field("selection"):
+                match sel:
+                    Value.Object(sslot): sslot.set_field("value", Value.Str(act_arg))
+                    _: nil
+            return Value.Void
+        return Value.Void
+    if method_name == "expand" or method_name == "expandIn":
+        var Value st_arg = Value.Nil
+        if args.length > 0:
+            st_arg = args[0]
+        mut [Value] body_args = []
+        if let expected_state = view_state_name(decl):
+            # A state of another type (the runtime's placeholder `NoState`) means "mount fresh".
+            var state_ok = false
+            match st_arg:
+                Value.Object(sto):
+                    if sto.type_name == expected_state:
+                        state_ok = true
+                _: nil
+            if not state_ok:
+                st_arg = view_make_state(interp, inner, decl, true)
+            body_args.push(st_arg)
+        if let env_name = view_env_name(decl):
+            # Each `env` field is the first value in scope (nearest ancestor first) of its type.
+            var [Value] scope = []
+            if method_name == "expandIn" and args.length > 1:
+                match args[1]:
+                    Value.Array(sc): scope = sc
+                    _: nil
+            guard let edecl = interp.get_struct_decl(env_name) else: return Value.Nil
+            mut [Value] env_args = []
+            for ef in edecl.fields:
+                let want = type_decl_name(ef.ty)
+                var Value? found = nil
+                for sv in scope:
+                    var have = ""
+                    match sv:
+                        Value.Object(so): have = so.type_name
+                        Value.EnumVariant(etn, _, _): have = etn
+                        _: nil
+                    if have == want and found == nil:
+                        found = sv
+                if let fv = found:
+                    env_args.push(Value.Labeled(ef.name, fv))
+                else:
+                    if let mdecl = interp.get_struct_decl("EnvMissing"):
+                        return instantiate_struct(interp, mdecl, [Value.Labeled("what", Value.Str(want))])
+                    return Value.Nil
+            body_args.push(instantiate_struct(interp, edecl, env_args))
+        return call_method(interp, self_val, "body", body_args)
+    nil
+
 def Value call_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
     match recv:
         Value.Fixed(fraw, fsg, fn_, fm):
@@ -2012,18 +2278,32 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
             let method_decl_opt = interp.find_best_method(type_name, method_name, args)
             if let method_decl = method_decl_opt:
                 let self_val = Value.Object(inner)
-                # `view` methods take the mounted state as a trailing `__st` parameter. A call
-                # that omits it (`self.touch()` inside the view) forwards the caller's own.
+                # `view` methods take the mounted state (`__st`) and the environment (`__env`) as
+                # trailing parameters. A call that omits them (`self.touch()` inside the view)
+                # forwards the caller's own.
                 var [Value] call_args = args
                 var Value? forwarded_st = nil
-                let last_pi = method_decl.params.length - 1
-                if last_pi >= 0 and method_decl.params[last_pi].name == "__st" and args.length < method_decl.params.length:
-                    let fwd_st = interp.current_env.get("__st")
-                    if let fwd = fwd_st:
-                        call_args = call_args + [fwd.clone()]
-                        view_sync(interp, fwd.clone(), false, 1)
-                        view_sync(interp, self_val.clone(), true, 1)
-                        forwarded_st = fwd
+                var fwd_i = args.length
+                while fwd_i < method_decl.params.length:
+                    let fwd_param_name = method_decl.params[fwd_i].name
+                    if fwd_param_name == "__st":
+                        let fwd_st = interp.current_env.get("__st")
+                        if let fwd = fwd_st:
+                            call_args = call_args + [fwd.clone()]
+                            view_sync(interp, fwd.clone(), false, 1)
+                            view_sync(interp, self_val.clone(), true, 1)
+                            forwarded_st = fwd
+                        else:
+                            break
+                    elif fwd_param_name == "__env":
+                        let fwd_env = interp.current_env.get("__env")
+                        if let fe = fwd_env:
+                            call_args = call_args + [fe.clone()]
+                        else:
+                            break
+                    else:
+                        break
+                    fwd_i = fwd_i + 1
                 let child_env = push_scope(interp)
                 env_define(interp, "self", self_val, false)
                 for field in inner.fields:
@@ -2042,12 +2322,29 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 let mutating = method_decl.mutating
                 let method_params = method_decl.params
                 # `view`: expose `bind`s and the mounted state's fields as locals, copy them back after.
+                var has_st_param = false
+                var has_env_param = false
+                for vp in method_decl.params:
+                    if vp.name == "__st":
+                        has_st_param = true
+                    if vp.name == "__env":
+                        has_env_param = true
                 var view_state_opt = interp.current_env.get("__st")
-                if last_pi < 0 or method_decl.params[last_pi].name != "__st":
+                if not has_st_param:
                     view_state_opt = nil
                 view_sync(interp, self_val.clone(), true, 0)
                 if let vs = view_state_opt:
                     view_sync(interp, vs, false, 0)
+                # `env` values are read-only locals of the view's methods.
+                if has_env_param:
+                    let view_env_opt = interp.current_env.get("__env")
+                    if let veo = view_env_opt:
+                        match veo:
+                            Value.Object(env_obj):
+                                for ef in env_obj.fields:
+                                    if not ef.0.starts_with("__"):
+                                        env_define(interp, ef.0, ef.1, false)
+                            _: nil
                 let result = exec_method_body(interp, method_decl)
                 let method_scope = interp.current_env
                 capture_var_param_outs(interp, method_params, method_scope)
@@ -2076,6 +2373,14 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 # `upgrade()` on weak ref — in the interpreter all refs are strong, just return self
                 if method_name == "upgrade":
                     return Value.Object(inner)
+                # A `view`: the runtime-facing generated methods, then method-form modifiers.
+                if let view_decl = interp.get_struct_decl(type_name.clone()):
+                    if decl_is_view(view_decl):
+                        if let vres = view_runtime_method(interp, Value.Object(inner), inner, view_decl, method_name, args):
+                            return vres
+                        if inner.get_field(method_name) == nil:
+                            if let modres = view_modifier_call(interp, Value.Object(inner), method_name, args):
+                                return modres
                 # A function-typed field called with method syntax: `obj.onTap(args)`.
                 let fn_field_opt = inner.get_field(method_name)
                 if let fn_field = fn_field_opt:

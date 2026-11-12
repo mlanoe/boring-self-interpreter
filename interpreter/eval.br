@@ -729,7 +729,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         match last_field.ty:
                             Type.Array(_):
                                 let values = collect_array_block(interp, body, interp.current_env)
-                                return instantiate_struct(interp, decl, [Value.Array(values)])
+                                return instantiate_struct(interp, decl, [Value.Labeled(last_field.name, Value.Array(values))])
                             _: nil
             Value.Closure(params, body, interp.current_env)
 
@@ -3856,6 +3856,12 @@ def Value instantiate_struct(mut Interpreter interp, StructDecl decl, [Value] ar
                 if let default_expr = param_default:
                     pval = eval_expr(interp, default_expr)
             fields.push((param.name, pval))
+    # A view description also carries the `state` seeds written at its construction.
+    if let seed_state = view_state_name(decl):
+        if let seed_decl = interp.get_struct_decl(seed_state):
+            for sf in seed_decl.fields:
+                if labeled.has(sf.name):
+                    fields.push(("__seed_{sf.name}", labeled[sf.name]))
     let ref_id = interp.next_ref_id
     interp.next_ref_id = ref_id + 1
     fields.push(("__ref_id", Value.Int(ref_id)))

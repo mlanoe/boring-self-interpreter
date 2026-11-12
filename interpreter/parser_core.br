@@ -248,6 +248,15 @@ def void parser_skip_newlines_and_indent(mut Parser p) throws:
         _ = p.advance()
         nil
 
+# Was the token just consumed a `Dedent` (an indented block just ended)? Reads `pos` and the
+# token list in separate steps: both go through the parser's lock.
+def bool parser_prev_is_dedent(mut Parser p):
+    let idx = p.pos
+    if idx <= 0:
+        return false
+    let prev_tok = parser_peek_token_at(p, -1)
+    token_kind_name(prev_tok.kind) == "Dedent"
+
 def void parser_expect_newline(mut Parser p) throws:
     if parser_check(p, "Newline") or parser_check(p, "Semicolon") or parser_check(p, "Eof"):
         if not parser_check(p, "Eof"):
@@ -255,6 +264,10 @@ def void parser_expect_newline(mut Parser p) throws:
     else if parser_check(p, "Dedent") and (parser_check2(p, "RParen") or parser_check2(p, "RBracket") or parser_check2(p, "RBrace")):
         # Last statement of a multi-line closure body ended on the line's closing
         # delimiter (`onTap = ():\n    foo())`): the Dedent precedes the delimiter.
+        return
+    else if parser_prev_is_dedent(p):
+        # The statement ended with an indented block (`Column(spacing = 8):` + lines, a
+        # trailing closure body, ...): the block's own Dedent already closed the line.
         return
     else:
         throw "expected newline, got {token_kind_name(p.peek())}"
@@ -1540,6 +1553,11 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
     let view_start = p.pos
     _ = p.advance()
     let name = parser_expect_ident(p)
+    # `view Name<T, U>`: type parameters are erased here.
+    if p.eat(TokenKind.Lt):
+        while p.peek() != TokenKind.Gt and p.peek() != TokenKind.Eof:
+            p.advance()
+        _ = p.eat(TokenKind.Gt)
     mut [string] view_protocols = []
     if p.eat(TokenKind.As):
         while p.peek() != TokenKind.Colon and p.peek() != TokenKind.Newline and p.peek() != TokenKind.Eof:
@@ -1553,6 +1571,7 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
     mut fields = [FieldDecl]{}
     mut state_fields = [FieldDecl]{}
     mut [string] bind_names = []
+    mut env_fields = [FieldDecl]{}
     mut methods = [FnDecl]{}
     while p.peek() != TokenKind.Dedent:
         if p.peek() == TokenKind.Eof:
@@ -1568,7 +1587,11 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
             _ = p.eat(TokenKind.Let)
             _ = p.eat(TokenKind.Var)
             _ = p.eat(TokenKind.Mut)
-            let fty2 = parse_type(p)
+            # An untyped `state`/`bind` field (implicit generics): its type comes from use / seed.
+            var Type fty2 = Type.TypeParam("_")
+            let untyped_view_field = parser_check(p, "Ident") and (parser_token_at_offset_is(p, 1, "Newline") or parser_token_at_offset_is(p, 1, "Eq") or parser_token_at_offset_is(p, 1, "Eof"))
+            if not untyped_view_field:
+                fty2 = parse_type(p)
             let fname2 = parser_expect_ident(p)
             var Expr? fdefault2 = nil
             if p.eat(TokenKind.Eq):
@@ -1577,6 +1600,8 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
             let fld2 = FieldDecl(name= fname2, is_pub= true, ty= fty2, mutable= true, is_transient= false, default= fdefault2, attrs= [], line= line)
             if is_state2:
                 state_fields.push(fld2)
+            elif word == "env":
+                env_fields.push(fld2)
             else:
                 fields.push(fld2)
                 if word == "bind":
@@ -1643,6 +1668,8 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
         mut [Param] mparams = m.params
         if state_fields.length > 0:
             mparams.push(Param(name= "__st", ty= Type.Named(state_name), mutable= true, owned= false, variadic= false, default= nil, line= m.line))
+        if env_fields.length > 0:
+            mparams.push(Param(name= "__env", ty= Type.Named(name + "__Env"), mutable= false, owned= false, variadic= false, default= nil, line= m.line))
         # The description itself is never written (inputs are immutable; state lives in `__st`).
         lowered.push(FnDecl(name= m.name, qualifier= m.qualifier, params= mparams, return_ty= m.return_ty, body= m.body, is_pub= m.is_pub, can_throw= m.can_throw, is_task= m.is_task, is_stream= m.is_stream, stream_capacity= m.stream_capacity, mutating= false, is_native= m.is_native, throws_ty= m.throws_ty, type_params= m.type_params, where_clause= m.where_clause, attrs= m.attrs, line= m.line))
     if state_fields.length > 0:
@@ -1658,7 +1685,13 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
             else:
                 sfields.push(sf1)
         p.pending.push(Item.Struct(StructDecl(name= state_name, fields= sfields, methods= [], inits= [], line= line, is_pub= is_pub, is_native= false, protocols= [], conversions= [], type_params= [], where_clause= [], setters= [], type_methods= [], type_vars= [], assoc_type_defs= [], attrs= [Attr(name= "slot", args= bound_states, line= line)])))
-    StructDecl(name= name, fields= fields, methods= lowered, inits= [], line= line, is_pub= is_pub, is_native= false, protocols= view_protocols, conversions= [], type_params= [], where_clause= [], setters= [], type_methods= [], type_vars= [], assoc_type_defs= [], attrs= [Attr(name= "bind", args= bind_names, line= line)])
+    if env_fields.length > 0:
+        p.pending.push(Item.Struct(StructDecl(name= name + "__Env", fields= env_fields, methods= [], inits= [], line= line, is_pub= is_pub, is_native= false, protocols= [], conversions= [], type_params= [], where_clause= [], setters= [], type_methods= [], type_vars= [], assoc_type_defs= [], attrs= [])))
+    mut [string] view_info = [""]
+    if state_fields.length > 0:
+        view_info[0] = state_name
+    view_info.push(if env_fields.length > 0: name + "__Env" else: "")
+    StructDecl(name= name, fields= fields, methods= lowered, inits= [], line= line, is_pub= is_pub, is_native= false, protocols= view_protocols, conversions= [], type_params= [], where_clause= [], setters= [], type_methods= [], type_vars= [], assoc_type_defs= [], attrs= [Attr(name= "bind", args= bind_names, line= line), Attr(name= "view", args= view_info, line= line)])
 
 # ─── Attributes ──────────────────────────────────────────────────────────────
 
