@@ -604,6 +604,23 @@ def bool parser_is_for_with_vars(mut Parser p) throws:
 def bool parser_is_task_fn_shorthand(mut Parser p) throws:
     false
 
+# Implicit generics: `int total(a, b):` has untyped parameters, so none of the typed-parameter
+# patterns match. The parameter list is a declaration iff its closing `)` is followed by `:`
+# or `throws` (a call is never followed by either at statement start).
+def bool parser_paren_list_then_colon(mut Parser p, int lparen_off):
+    var depth = 0
+    var i = lparen_off
+    while i < lparen_off + 80:
+        let tk = token_kind_name(parser_peek_token_at(p, i).kind)
+        if tk == "LParen": depth = depth + 1
+        if tk == "RParen":
+            depth = depth - 1
+            if depth == 0:
+                return parser_token_at_offset_is(p, i + 1, "Colon") or parser_token_at_offset_is(p, i + 1, "Throws")
+        if tk == "Eof" or tk == "Newline": return false
+        i = i + 1
+    false
+
 def bool parser_is_fn_shorthand(mut Parser p) throws:
     # Detect: `RetType FnName(TypedParams...):`
     # We need to distinguish `int add(int a, int b):` from `print foo(42)`
@@ -690,7 +707,7 @@ def bool parser_is_fn_shorthand(mut Parser p) throws:
             # with either token, so this alone proves it's a typed parameter list.
             if p0 == "Var" or p0 == "Mut": return true
             if p0 == "LParen" and parser_paren_group_then_ident(p, params_off): return true
-            return false
+            return parser_paren_list_then_colon(p, lparen_off)
     # Pattern: [ ... ] [Question] Ident LParen → array return type
     if parser_token_at_offset_is(p, 0, "LBracket"):
         var depth = 0
@@ -719,7 +736,7 @@ def bool parser_is_fn_shorthand(mut Parser p) throws:
                         if p0 == "LBrace" and p1 == "Ident": return true
                         if p0 == "Var" or p0 == "Mut": return true
                         if p0 == "LParen" and parser_paren_group_then_ident(p, after_lparen): return true
-                        return false
+                        return parser_paren_list_then_colon(p, lparen_off)
             if tok == "Eof": return false
             i = i + 1
         return false
@@ -1083,6 +1100,19 @@ def FnDecl parse_fn_decl(mut Parser p, bool is_pub, bool is_def) throws:
     let body = parse_fn_body(p)
     FnDecl(name= name, params= params, return_ty= return_ty, can_throw= can_throw, mutating= mutating, is_pub= is_pub, body= body, line= line, qualifier= nil, is_task= false, is_stream= false, stream_capacity= nil, is_native= false, throws_ty= nil, type_params= [], where_clause= [], attrs= [])
 
+# `name`, `name = default` or `name'qual` followed by `,` / `)` : a parameter written without a type.
+def bool parser_untyped_param_ahead_at(mut Parser p, int start):
+    if not parser_token_at_offset_is(p, start, "Ident"):
+        return false
+    var off = start + 1
+    # Qualifier names are identifiers or keyword tokens (`guard`, `static`, `mut`, ...).
+    while parser_token_at_offset_is(p, off, "Tick") and not parser_token_at_offset_is(p, off + 1, "Question") and not parser_token_at_offset_is(p, off + 1, "Newline") and not parser_token_at_offset_is(p, off + 1, "Eof"):
+        off = off + 2
+    parser_token_at_offset_is(p, off, "Comma") or parser_token_at_offset_is(p, off, "RParen") or parser_token_at_offset_is(p, off, "Eq")
+
+def bool parser_untyped_param_ahead(mut Parser p):
+    parser_untyped_param_ahead_at(p, 0)
+
 def Param parse_param(mut Parser p) throws:
     let line = p.current_line()
     var mutable = p.eat(TokenKind.Var)
@@ -1093,6 +1123,22 @@ def Param parse_param(mut Parser p) throws:
     _ = p.eat(TokenKind.Req)
     _ = p.eat(TokenKind.Task)
     _ = p.eat(TokenKind.Pub)
+    # Implicit generics: a parameter written without a type (`x`, `x = 1`) is a fresh
+    # type parameter; this interpreter is dynamically typed, so it is just untyped.
+    # `var mut a` / `mut a`: a `mut` after `var` belongs to the (absent) type position.
+    if parser_check(p, "Mut") and parser_untyped_param_ahead_at(p, 1):
+        _ = p.advance()
+        mutable = true
+    if parser_untyped_param_ahead(p):
+        let untyped_name = p.expect(TokenKind.Ident(""))
+        # A qualifier written after the name (`a'actor`) has no effect here.
+        while p.peek() == TokenKind.Tick:
+            _ = p.advance()
+            _ = p.advance()
+        var Expr? untyped_default = nil
+        if p.eat(TokenKind.Eq):
+            untyped_default = parse_expr(p)
+        return Param(name= untyped_name.text(), ty= nil, mutable= mutable, owned= false, variadic= false, default= untyped_default, line= line)
     let base_ty = parse_type(p)
     let ty = parse_type_qualifier(p, base_ty)
     # Handle variadic: `int... args`
@@ -1261,6 +1307,16 @@ def FieldDecl parse_field_decl(mut Parser p) throws:
         mutable = true
     else:
         p.eat(TokenKind.Let)
+    # Implicit generics: a field written without a type (`status`, `let inner`) is a
+    # fresh type parameter of the struct; here it is just an erased type.
+    if parser_check(p, "Ident") and (parser_token_at_offset_is(p, 1, "Newline") or parser_token_at_offset_is(p, 1, "Eq")):
+        let untyped_tok = p.expect(TokenKind.Ident(""))
+        var Expr? untyped_default = nil
+        if p.eat(TokenKind.Eq):
+            untyped_default = parse_expr(p)
+        while p.eat(TokenKind.Newline):
+            nil
+        return FieldDecl(name= untyped_tok.text(), ty= Type.TypeParam("_"), mutable= mutable, default= untyped_default, line= line, is_pub= false, is_transient= false)
     let ty = parse_type(p)
     let name_tok = p.expect(TokenKind.Ident(""))
     var Expr? default = nil
