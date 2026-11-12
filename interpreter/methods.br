@@ -101,6 +101,43 @@ def bool value_matches_named_type_static(Value val, string name):
         "string": vt == "string"
         _: true
 
+# A user struct/enum value against a `Named` parameter type: a struct/enum name needs the same
+# type, a trait name needs the value's type to list it among its protocols (`struct Sq as Shape`).
+# Anything else (scalars, unknown names) is left to `value_matches_type_static`.
+def bool value_conforms_named_type(Interpreter interp, Value val, Type ty):
+    match ty:
+        Type.Qualified(inner, _): value_conforms_named_type(interp, val, inner)
+        Type.Named(name):
+            var vname = ""
+            var [string] vprotocols = []
+            var is_user_value = false
+            match val:
+                Value.Object(o):
+                    vname = o.type_name
+                    is_user_value = true
+                    if let sd = interp.get_struct_decl(o.type_name):
+                        vprotocols = sd.protocols
+                Value.EnumVariant(etn, _, _):
+                    vname = etn
+                    is_user_value = true
+                    if let ed = interp.get_enum_decl(etn):
+                        vprotocols = ed.protocols
+                _: nil
+            if not is_user_value:
+                return true
+            if vname == name:
+                return true
+            if let _ = interp.get_struct_decl(name):
+                return false
+            if let _ = interp.get_enum_decl(name):
+                return false
+            # a trait (or an unknown name): the value must declare it
+            for pr in vprotocols:
+                if pr == name:
+                    return true
+            false
+        _: true
+
 def bool value_matches_type_static(Value val, Type ty):
     let vt = val_type_name(val)
     match ty:

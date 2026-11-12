@@ -3209,6 +3209,8 @@ def Value resolve_overload(Interpreter interp, [Value] variants, [Value] args):
                             if let pty = p.ty:
                                 if not value_matches_type_static(args[j], pty):
                                     all_match = false
+                                elif not value_conforms_named_type(interp, args[j], pty):
+                                    all_match = false
                             j = j + 1
                         if all_match:
                             return variants[i]
