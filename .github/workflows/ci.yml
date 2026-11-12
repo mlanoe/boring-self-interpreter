@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      # This project depends on the boring repository (compiler binary + shared test corpus),
+      # expected as a sibling directory: <workspace>/boring and <workspace>/boring-self-interpreter.
+      - uses: actions/checkout@v4
+        with:
+          path: boring-self-interpreter
+
+      - uses: actions/checkout@v4
+        with:
+          repository: mlanoe/boring
+          path: boring
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the boring compiler
+        working-directory: boring
+        run: cargo build --release --locked
+
+      - name: Transpile smoke test
+        working-directory: boring-self-interpreter
+        run: cargo test --test interpreter
+
+      # Four `boring build` + `cargo build` runs (strict/managed x multi/single).
+      - name: Build the interpreter (4 variants)
+        working-directory: boring-self-interpreter
+        run: cargo test --test interpreter_build -- --test-threads=1
+
+      - name: Functional suite (shared corpus, 4 binaries)
+        working-directory: boring-self-interpreter
+        run: cargo test --test interpreter_functional

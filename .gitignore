@@ -1,0 +1,5 @@
+/target
+# Generated Rust projects from `boring build` (all mode/threading variants)
+interpreter/*_rust
+interpreter/*_rust_*
+.DS_Store

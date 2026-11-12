@@ -1,0 +1,9 @@
+[package]
+name        = "boring-self-interpreter"
+version     = "0.1.0"
+edition     = "2021"
+description = "The Boring interpreter written in Boring itself, validated against the boring repository's shared test corpus"
+publish     = false
+
+# No library or binary: this crate only hosts the integration tests in tests/. The
+# interpreter proper is the Boring project in interpreter/ (built with `boring build`).
