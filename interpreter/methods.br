@@ -386,6 +386,62 @@ def int128? std_time_int_arg([Value] args):
         Value.Uint32(n): n as int128
         _: nil
 
+# `fs` module of the guest program (`use fs`): the synchronous subset of the Rust
+# interpreter's `fs.*`. Errors are thrown as strings, like the Rust interpreter does.
+def Value? fs_fail(mut Interpreter interp, string msg):
+    interp.set_pending_throw(Value.Str(msg))
+    Value.Nil
+
+Value? fs_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
+    match recv:
+        Value.NativeFn(nname, _):
+            if nname != "fs":
+                return nil
+            let first = args[0] else Value.Nil
+            var string path = ""
+            match first:
+                Value.Str(ps): path = ps
+                _: return fs_fail(interp, "fs.{method_name}: expected a string path")
+            if method_name == "exists":
+                return Value.Bool(fs.exists(path.clone()))
+            if method_name == "isFile":
+                return Value.Bool(fs.isFile(path.clone()))
+            if method_name == "isDir":
+                return Value.Bool(fs.isDir(path.clone()))
+            if method_name == "read":
+                let text = try? fs.read(path.clone())
+                guard let content = text else: return fs_fail(interp, "fs.read: cannot read '{path}'")
+                return Value.Str(content)
+            if method_name == "readLines":
+                let text = try? fs.read(path.clone())
+                guard let content = text else: return fs_fail(interp, "fs.readLines: cannot read '{path}'")
+                mut [Value] lines = []
+                for line in content.lines():
+                    lines.push(Value.Str(line))
+                return Value.Array(lines)
+            if method_name == "readBytes":
+                let data = try? fs.readBytes(path.clone())
+                guard let bytes = data else: return fs_fail(interp, "fs.readBytes: cannot read '{path}'")
+                mut [Value] vals = []
+                for b in bytes:
+                    vals.push(Value.Uint8(b))
+                return Value.Array(vals)
+            if method_name == "write" or method_name == "append":
+                let second = args[1] else Value.Nil
+                var string text = ""
+                match second:
+                    Value.Str(ts): text = ts
+                    _: return fs_fail(interp, "fs.{method_name}: expected a string")
+                if method_name == "write":
+                    let ok = try? fs.write(path.clone(), text.clone())
+                    guard let _ = ok else: return fs_fail(interp, "fs.write: cannot write '{path}'")
+                else:
+                    let ok = try? fs.append(path.clone(), text.clone())
+                    guard let _ = ok else: return fs_fail(interp, "fs.append: cannot write '{path}'")
+                return Value.Nil
+            nil
+        _: nil
+
 Value? std_time_method(Value recv, string method_name, [Value] args):
     match recv:
         Value.NativeFn(nname, _):
@@ -509,6 +565,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
             if let fres = fixed_method(fraw, FixedFmt(signed = fsg, n = fn_, m = fm), method_name, args):
                 return fres
         _: nil
+    if let fs_res = fs_method(interp, recv, method_name, args):
+        return fs_res
     if let std_res = std_time_method(recv, method_name, args):
         return std_res
     if method_name == "introspect" or method_name == "get":

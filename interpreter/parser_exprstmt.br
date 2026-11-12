@@ -125,7 +125,13 @@ def Stmt parse_inline_stmt_impl(mut Parser p, bool stop_at_else) throws:
     if parser_check(p, "Continue"):
         parser_advance(p)
         return make_continue_stmt(line)
+    # `Group:` + indented block as a whole statement is the trailing array-block form: allow the
+    # bare `name:` closure shape here only (never inside a condition such as `if two:`).
+    let stmt_saved_noparen = parser_get_allow_noparen_closure(p)
+    if parser_check(p, "Ident") and parser_peek_next_is_colon(p) and parser_token_at_offset_is(p, 2, "Newline") and parser_token_at_offset_is(p, 3, "Indent"):
+        parser_set_allow_noparen_closure(p, true)
     let lhs = if stop_at_else: parse_or(p) else: parse_else_expr(p)
+    parser_set_allow_noparen_closure(p, stmt_saved_noparen)
     if parser_eat(p, "Eq"):
         let rhs = parse_or(p)
         return stmt_expr(make_assign(lhs, rhs, line), line)
@@ -561,6 +567,14 @@ def Expr parse_postfix_inner(mut Parser p, bool allow_chain) throws:
             parser_expect(p, "Gt")
             let args = parse_call_args(p)
             expr = make_generic_call(expr, type_args, args, line)
+        elif parser_check(p, "Lt") and parser_peek_generic_type_call(p):
+            # `Box<int>.of(3)`: the type arguments are erased; `.of(3)` is then a plain
+            # type-level call on `Box`.
+            parser_advance(p)
+            _ = parse_generic_type_arg(p)
+            while parser_eat(p, "Comma"):
+                _ = parse_generic_type_arg(p)
+            parser_expect(p, "Gt")
         elif parser_check(p, "LBracket"):
             parser_advance(p)
             if parser_peek_is_labeled_start(p):
@@ -1476,7 +1490,10 @@ def Stmt parse_stmt(mut Parser p) throws:
             lhs
     else:
         lhs
-    parser_expect_newline(p)
+    # A block-bodied closure (`Group:` + indented block) has already consumed its own line end.
+    match expr.kind:
+        ExprKind.Closure(_, _, _, _, _): parser_expect_newline_soft(p)
+        _: parser_expect_newline(p)
     stmt_expr(expr, line)
 
 def LetStmt parse_let_stmt(mut Parser p) throws:

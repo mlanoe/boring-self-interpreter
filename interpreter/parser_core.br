@@ -195,7 +195,7 @@ def string parser_expect_ident_or_keyword(mut Parser p) throws:
     if name == "Join":
         _ = p.advance()
         return "join"
-    if name == "Ident" or name == "Let" or name == "Var" or name == "Def" or name == "Return" or name == "If" or name == "For" or name == "While" or name == "Match" or name == "Type" or name == "Set" or name == "Get" or name == "In" or name == "Is" or name == "As" or name == "Mod" or name == "Nil" or name == "Wait" or name == "Task" or name == "Use" or name == "With":
+    if name == "Ident" or name == "Let" or name == "Var" or name == "Def" or name == "Return" or name == "If" or name == "For" or name == "While" or name == "Match" or name == "Type" or name == "Set" or name == "Get" or name == "In" or name == "Is" or name == "As" or name == "Mod" or name == "Nil" or name == "Wait" or name == "Task" or name == "Use" or name == "With" or name == "Pass":
         return p.advance().text()
     throw "expected identifier or keyword, got {name}"
 
@@ -358,6 +358,26 @@ def bool parser_peek_generic_args_at(mut Parser p, int offset):
         i += 1
     token_kind_name(parser_peek_token_at(p, i).kind) == "LParen"
 
+# `Type<Args>.method(...)`: explicit type arguments on a type-level call. Same scan as
+# `parser_peek_generic_args_at`, but the closing `>` must be followed by `.name(`.
+def bool parser_peek_generic_type_call(mut Parser p):
+    if token_kind_name(parser_peek_token_at(p, 0).kind) != "Lt":
+        return false
+    var i = 1
+    var depth = 1
+    if token_kind_name(parser_peek_token_at(p, i).kind) == "Gt":
+        return false
+    while depth > 0:
+        let kind = token_kind_name(parser_peek_token_at(p, i).kind)
+        if kind == "Lt":
+            depth += 1
+        elif kind == "Gt":
+            depth -= 1
+        elif kind != "Ident" and kind != "Void" and kind != "Comma" and kind != "Question" and kind != "LBracket" and kind != "RBracket" and kind != "LBrace" and kind != "RBrace" and kind != "Eq" and kind != "Int" and kind != "Tick" and kind != "Ampersand" and kind != "Mut" and kind != "Dot" and kind != "Guard":
+            return false
+        i += 1
+    token_kind_name(parser_peek_token_at(p, i).kind) == "Dot" and token_kind_name(parser_peek_token_at(p, i + 1).kind) == "Ident" and token_kind_name(parser_peek_token_at(p, i + 2).kind) == "LParen"
+
 def bool parser_peek_is_generic_call(mut Parser p):
     parser_peek_generic_args_at(p, 1)
 
@@ -497,7 +517,8 @@ def bool parser_is_type_start_before_ident(mut Parser p):
                 if depth == 0:
                     # Collection types may carry an ownership qualifier before
                     # the binding name: `[int]'shared items`.
-                    return parser_token_at_offset_is(p, i + 1, "Ident") or parser_token_at_offset_is(p, i + 1, "Tick")
+                    # An optional collection type: `[int]? name`.
+                    return parser_token_at_offset_is(p, i + 1, "Ident") or parser_token_at_offset_is(p, i + 1, "Tick") or (parser_token_at_offset_is(p, i + 1, "Question") and parser_token_at_offset_is(p, i + 2, "Ident"))
             if kind == "Eof" or depth < 0:
                 return false
             i = i + 1
@@ -962,7 +983,7 @@ def FnDecl parse_fn_decl_shorthand(mut Parser p) throws:
     FnDecl(name= name, params= params, return_ty= return_ty, can_throw= can_throw, mutating= true, is_pub= false, body= body, line= line, qualifier= nil, is_task= false, is_stream= false, stream_capacity= nil, is_native= false, throws_ty= nil, type_params= [], where_clause= [], attrs= [])
 
 def bool token_is_fn_name_like(string n):
-    n == "Ident" or n == "Get" or n == "Set" or n == "In" or n == "Mod" or n == "Nil" or n == "Is" or n == "Tick" or n == "With"
+    n == "Ident" or n == "Get" or n == "Set" or n == "In" or n == "Mod" or n == "Nil" or n == "Is" or n == "Tick" or n == "With" or n == "Use" or n == "Pass"
 
 def FnDecl parse_fn_decl(mut Parser p, bool is_pub, bool is_def) throws:
     let line = p.current_line()
@@ -3559,6 +3580,10 @@ def Type parse_generic_type_arg(mut Parser p) throws:
     if parser_check(p, "Ident") and parser_token_at_offset_is(p, 1, "Eq"):
         _ = p.advance()
         p.advance()
+    # A const-generic argument (`Grid<N = 4>`, `Grid<4>`): erased here, like every type argument.
+    if parser_check(p, "Int"):
+        p.advance()
+        return Type.Int
     parse_type(p)
 
 def Type parse_type_qualifier(mut Parser p, Type base) throws:
@@ -3567,9 +3592,16 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
     # 'T'?' means Optional<T>
     if p.eat(TokenKind.Question):
         return Type.Optional(base)
+    # `'task`: the tokio-lock flavour of a handle, no runtime effect here.
+    if p.eat(TokenKind.Task):
+        return base
     # Handle `guard` as a keyword token
     if p.eat(TokenKind.Guard):
         let qualified = Type.Qualified(base, OwnerQual.Guard)
+        # `'guard'task`
+        if parser_check(p, "Tick") and parser_token_at_offset_is(p, 1, "Task"):
+            _ = p.eat(TokenKind.Tick)
+            _ = p.eat(TokenKind.Task)
         if p.eat(TokenKind.Question):
             return Type.Optional(qualified)
         return qualified
@@ -3629,6 +3661,11 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
             _ = p.eat(TokenKind.Tick)
             _ = p.eat(TokenKind.Guard)
             qualified = Type.Qualified(qualified, OwnerQual.Guard)
+        elif next_k == "Task":
+            # `'actor'task` / `'guard'task`: which lock implementation backs the handle is
+            # a compile-time detail with no runtime effect here.
+            _ = p.eat(TokenKind.Tick)
+            _ = p.eat(TokenKind.Task)
         elif next_k == "Ident":
             let peek_q = parser_peek_token_at(p, 1).text()
             if peek_q != "actor" and peek_q != "shared" and peek_q != "guard" and peek_q != "inline" and peek_q != "owned" and peek_q != "weak" and peek_q != "new" and peek_q != "observed":

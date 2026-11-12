@@ -647,10 +647,17 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
         # Dict literal
         ExprKind.Dict(pairs):
             mut entries = []
+            mut [Value] dvals = []
+            mut [Expr] dexprs = []
+            for pair in pairs:
+                dvals.push(eval_expr(interp, pair.1))
+                dexprs.push(pair.1)
+            let dvals_adopted = adopt_literal_float_width(dvals, dexprs)
+            var di = 0
             for pair in pairs:
                 let k = eval_expr(interp, pair.0)
-                let v = eval_expr(interp, pair.1)
-                entries.push((k, v))
+                entries.push((k, dvals_adopted[di]))
+                di = di + 1
             Value.Dict(entries)
 
         # Set literal
@@ -838,6 +845,11 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                         _: v
                 _:
                     let v = eval_expr(interp, inner)
+                    # `throwingCall() else (default)`: the default also applies when the call throws.
+                    if interp.has_pending_throw:
+                        interp.has_pending_throw = false
+                        interp.pending_throw_val = Value.Nil
+                        return eval_expr(interp, default_expr)
                     match v:
                         Value.Nil: eval_expr(interp, default_expr)
                         _: v
@@ -2617,6 +2629,22 @@ def Value cast_value(mut Interpreter interp, Value val0, Type ty):
         Type.Uint64: "uint64"
         Type.Uint128: "uint128"
         _: "unknown"
+    # Composite targets (`as [[uint8]]`, `[] as [Style'shared]`, `as {string = int}`): the value
+    # keeps its shape and takes the declared element types, like a declared binding.
+    if type_name == "unknown":
+        match ty:
+            Type.Qualified(qinner, _): return cast_value(interp, val0, qinner)
+            Type.Array(_): return coerce_declared_value(interp, val0, ty)
+            Type.ArrayN(_, _): return coerce_declared_value(interp, val0, ty)
+            Type.LabeledArray(_, _): return coerce_declared_value(interp, val0, ty)
+            Type.Dict(_, _): return coerce_declared_value(interp, val0, ty)
+            Type.Set(_): return coerce_declared_value(interp, val0, ty)
+            Type.Tuple(_): return coerce_declared_value(interp, val0, ty)
+            Type.Optional(oinner):
+                match val0:
+                    Value.Nil: return Value.Nil
+                    _: return cast_value(interp, val0, oinner)
+            _: nil
     # Fixed-point (docs/fixed-point-types.md): `as fixedN_M`, and fixed -> int/float.
     if let tfmt = fixed_fmt_of_name(type_name):
         return cast_to_fixed(val0, tfmt)
@@ -3164,6 +3192,24 @@ req string display_value(Interpreter interp, Value val):
                 result = result + display_value(interp, entries[i].0) + ": " + display_value(interp, entries[i].1)
                 i = i + 1
             result + "}}"
+        Value.Set(items):
+            var result = "{{"
+            var i = 0
+            while i < items.length:
+                if i > 0:
+                    result = result + ", "
+                result = result + display_value(interp, items[i])
+                i = i + 1
+            result + "}}"
+        Value.Tuple(items):
+            var result = "("
+            var i = 0
+            while i < items.length:
+                if i > 0:
+                    result = result + ", "
+                result = result + display_value(interp, items[i])
+                i = i + 1
+            result + ")"
         Value.Object(obj):
             # Newtype: single visible 'value' field → display underlying value
             mut visible_obj_fields = []
@@ -3254,6 +3300,36 @@ def Value eval_stmt_as_expr(mut Interpreter interp, Stmt stmt):
         _:
             exec_stmt(interp, stmt)
             Value.Nil
+
+# Untyped numeric literals in a literal adopt the width of a typed float16/float32 value of the
+# same literal (`{"a" = x, "b" = 2.0}` with `float16 x`), same rule as in an array literal.
+def [Value] adopt_literal_float_width([Value] vals, [Expr] exprs):
+    var has_f16 = false
+    var has_f32 = false
+    var i = 0
+    while i < exprs.length:
+        match vals[i]:
+            Value.Float16(_):
+                if not is_untyped_numeric_literal(exprs[i]):
+                    has_f16 = true
+            Value.Float32(_):
+                if not is_untyped_numeric_literal(exprs[i]):
+                    has_f32 = true
+            _: nil
+        i = i + 1
+    mut [Value] out = vals
+    if has_f16 or has_f32:
+        var j = 0
+        while j < exprs.length:
+            if is_untyped_numeric_literal(exprs[j]):
+                match vals[j]:
+                    Value.Float64(f):
+                        out[j] = if has_f16: Value.Float16(f as float16) else: Value.Float32(f as float32)
+                    Value.Int(n):
+                        out[j] = if has_f16: Value.Float16(n as float16) else: Value.Float32(n as float32)
+                    _: nil
+            j = j + 1
+    out
 
 # Match evaluation
 def Value eval_match_body(mut Interpreter interp, MatchBody body):
