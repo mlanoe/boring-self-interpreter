@@ -206,9 +206,25 @@ def Value eval_cond_in_env(mut Interpreter interp, Env'actor env, Expr expr):
 
 # ─── exec_stmt ────────────────────────────────────────────────────────────────
 
+# Remembers the declared type of a `let` (or that it holds a built-in optional) for `{x:?}`.
+def void record_let_type(mut Interpreter interp, LetStmt s):
+    mut {string=Type} dt = interp.declared_types
+    if let ty = s.ty:
+        dt.set(s.name, ty)
+    else:
+        var is_opt = false
+        if let e = s.value:
+            is_opt = expr_is_builtin_optional(e)
+        if is_opt:
+            dt.set(s.name, Type.Optional(Type.Named("_")))
+        else:
+            dt.remove(s.name)
+    interp.declared_types = dt
+
 def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
     match stmt:
         Let(s):
+            record_let_type(interp, s)
             var val = Uninitialized
             var string? move_source = nil
             if let expr = s.value:

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 use std.time.SystemTime, UNIX_EPOCH
+use std.net.TcpListener, TcpStream
+use std.io.Read, Write
 # == BUILT-IN METHODS ==
 
 # Generalized instead of one hand-written match arm per numeric-kind pair —
@@ -537,6 +539,115 @@ Value? std_time_method(Value recv, string method_name, [Value] args):
             nil
         _: nil
 
+# `std.net` loopback sockets of the guest program: `TcpListener.bind` / `TcpStream.connect`,
+# `local_addr`, `accept`, `write`/`write_all`/`flush`, `peer_addr`. `read`/`read_exact` fill a
+# caller buffer and are handled in `eval.br` (`net_read`). Errors are thrown as strings.
+def Value net_fail(mut Interpreter interp, string msg):
+    interp.set_pending_throw(Value.Str(msg))
+    Value.Nil
+
+def int? net_object_id(Value v):
+    match v:
+        Value.Object(o):
+            for f in o.fields:
+                if f.0 == "id":
+                    match f.1:
+                        Value.Uint(i): return i as int
+                        _: nil
+            nil
+        _: nil
+
+def Value net_object(string type_name, int id):
+    Value.Object(ObjectInner(type_name= type_name, fields= [("id", Value.Uint(id as uint))]))
+
+def [uint8]? net_bytes_arg([Value] args):
+    let first = args[0] else Value.Nil
+    match first:
+        Value.Array(items):
+            mut [uint8] out = []
+            for it in items:
+                match it:
+                    Value.Uint8(b): out.push(b)
+                    _: return nil
+            out
+        _: nil
+
+def Value? net_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
+    match recv:
+        Value.NativeFn(nname, _):
+            if (nname == "TcpListener" and method_name == "bind") or (nname == "TcpStream" and method_name == "connect"):
+                let first = args[0] else Value.Nil
+                match first:
+                    Value.Str(addr):
+                        var int? made = nil
+                        if nname == "TcpListener":
+                            made = try? interp.net.bind(addr)
+                        else:
+                            made = try? interp.net.connect(addr)
+                        guard let id = made else: return net_fail(interp, "{nname}.{method_name}: failed for '{addr}'")
+                        return net_object(nname, id)
+                    _: return net_fail(interp, "{nname}.{method_name}: expected an address string")
+            nil
+        Value.Object(inner):
+            guard let id = net_object_id(recv) else: return nil
+            if inner.type_name == "TcpListener":
+                if method_name == "local_addr" or method_name == "localAddr":
+                    let a = try? interp.net.listenerAddr(id)
+                    guard let addr = a else: return net_fail(interp, "local_addr failed")
+                    return Value.Str(addr)
+                if method_name == "accept":
+                    let r = try? interp.net.accept(id)
+                    guard let pair = r else: return net_fail(interp, "accept failed")
+                    return Value.Tuple([net_object("TcpStream", pair.0), Value.Str(pair.1)])
+                return nil
+            if inner.type_name == "TcpStream":
+                if method_name == "write_all" or method_name == "writeAll" or method_name == "write":
+                    guard let bytes = net_bytes_arg(args) else: return net_fail(interp, "write: expected a byte buffer")
+                    let n = try? interp.net.writeBytes(id, bytes, method_name != "write")
+                    guard let written = n else: return net_fail(interp, "write failed")
+                    if method_name == "write":
+                        return Value.Uint(written as uint)
+                    return Value.Void
+                if method_name == "flush":
+                    let ok = try? interp.net.flush(id)
+                    guard let _ = ok else: return net_fail(interp, "flush failed")
+                    return Value.Void
+                if method_name == "peer_addr" or method_name == "peerAddr" or method_name == "local_addr" or method_name == "localAddr":
+                    let a = try? interp.net.streamAddr(id, method_name.startsWith("peer"))
+                    guard let addr = a else: return net_fail(interp, "{method_name} failed")
+                    return Value.Str(addr)
+                return nil
+            nil
+        _: nil
+
+# `stream.read(buf)` / `stream.read_exact(buf)`: reads into a copy of the buffer and returns
+# the refilled buffer plus the byte count (void for `read_exact`). `nil` when `sock` is not a TcpStream.
+def (Value, Value)? net_read(mut Interpreter interp, Value sock, Value buf, bool exact):
+    guard let id = net_object_id(sock) else: return nil
+    match sock:
+        Value.Object(o):
+            if o.type_name != "TcpStream":
+                return nil
+        _: return nil
+    mut [uint8] bytes = []
+    match buf:
+        Value.Array(items):
+            for it in items:
+                match it:
+                    Value.Uint8(b): bytes.push(b)
+                    _: nil
+        _: nil
+    let r = try? interp.net.readInto(id, bytes, exact)
+    guard let res = r else:
+        _ = net_fail(interp, "read failed")
+        return (Value.Nil, Value.Nil)
+    mut [Value] out = []
+    for b in res.0:
+        out.push(Value.Uint8(b))
+    if exact:
+        return (Value.Array(out), Value.Void)
+    (Value.Array(out), Value.Uint(res.1 as uint))
+
 # `Introspect` (`x.introspect()`): `info.typeName`, `info.variantName`, `info.fields`, and
 # `Field.get(instance)` returning a `FieldValue`-wrapped value — what the transpiled program sees.
 def Value field_value_wrapped(Value v):
@@ -549,8 +660,54 @@ def Value field_value_wrapped(Value v):
         _: "Other"
     Value.EnumVariant("FieldValue", tag, [v])
 
+def Value introspect_field_full(string name, int index, bool is_pub, bool is_instance, bool is_mutable, bool is_rebindable, string owner, string kind):
+    Value.Object(ObjectInner(type_name= "Field", fields= [("name", Value.Str(name)), ("index", Value.Int(index)), ("isPublic", Value.Bool(is_pub)), ("isInstance", Value.Bool(is_instance)), ("isMutable", Value.Bool(is_mutable)), ("isRebindable", Value.Bool(is_rebindable)), ("__ownerType", Value.Str(owner)), ("__kind", Value.Str(kind))]))
+
 def Value introspect_field(string name, int index):
-    Value.Object(ObjectInner(type_name= "Field", fields= [("name", Value.Str(name)), ("index", Value.Int(index))]))
+    introspect_field_full(name, index, true, true, false, false, "", "instance")
+
+# "int" | "float" | "bool" | "string" for a primitive/string declared type, "" otherwise.
+def string introspect_prim_kind(Type? ty):
+    guard let t = ty else: return ""
+    match t:
+        Type.Int | Type.Uint | Type.Int8 | Type.Int16 | Type.Int32 | Type.Int64 | Type.Int128 | Type.Uint8 | Type.Uint16 | Type.Uint32 | Type.Uint64 | Type.Uint128: "int"
+        Type.Float32 | Type.Float64: "float"
+        Type.Bool: "bool"
+        Type.Str: "string"
+        Type.Named(n):
+            if n == "int" or n == "uint" or n == "int8" or n == "int16" or n == "int32" or n == "int64" or n == "int128" or n == "uint8" or n == "uint16" or n == "uint32" or n == "uint64" or n == "uint128" or n == "byte":
+                "int"
+            elif n == "float" or n == "float32" or n == "float64":
+                "float"
+            elif n == "bool":
+                "bool"
+            elif n == "string":
+                "string"
+            else:
+                ""
+        _: ""
+
+# Checks a `FieldValue` argument against a declared primitive type (throws like `boring build`).
+def string introspect_check_kind(Type? ty, Value arg, string label):
+    let kind = introspect_prim_kind(ty)
+    if kind == "":
+        return ""
+    var ok = false
+    match arg:
+        Value.EnumVariant(fvn, variant, fvf):
+            if fvn == "FieldValue" and fvf.length == 1:
+                match fvf[0]:
+                    Value.Int(_): ok = kind == "int" and variant == "Int"
+                    Value.Float64(_): ok = kind == "float" and variant == "Float"
+                    Value.Float32(_): ok = kind == "float" and variant == "Float"
+                    Value.Bool(_): ok = kind == "bool" and variant == "Bool"
+                    Value.Str(_): ok = kind == "string" and variant == "Str"
+                    _: nil
+        _: nil
+    if not ok:
+        let expected = if kind == "int": "an integer" elif kind == "float": "a float" elif kind == "bool": "a bool" else "a string"
+        return "wrong argument type for '{label}': expected {expected}"
+    ""
 
 def Value introspect_method_obj(string name, bool is_pub, bool is_instance, bool is_mutable, bool is_task, bool is_stream, bool is_throwing, string owner, string kind):
     var variant = "Plain"
@@ -582,6 +739,49 @@ def [Value] introspect_methods(string owner, [FnDecl] methods, [TypeMethod] type
 Value? introspect_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
     match recv:
         Value.Object(inner):
+            if inner.type_name == "Field" and (method_name == "get" or method_name == "set"):
+                var string fkind = ""
+                var string fowner = ""
+                var string fname2 = ""
+                if let kv = inner.get_field("__kind"):
+                    match kv:
+                        Value.Str(k): fkind = k
+                        _: nil
+                if let ov = inner.get_field("__ownerType"):
+                    match ov:
+                        Value.Str(o): fowner = o
+                        _: nil
+                if let nv = inner.get_field("name"):
+                    match nv:
+                        Value.Str(n): fname2 = n
+                        _: nil
+                if fkind == "type":
+                    guard let osd = interp.get_struct_decl(fowner) else: throw "unknown type '{fowner}'"
+                    if method_name == "get" and args.length == 0:
+                        guard let cur = interp.type_var_store.get(fowner + "::" + fname2) else: throw "no type-level field '{fname2}' on '{fowner}'"
+                        return field_value_wrapped(cur)
+                    if method_name == "set" and args.length == 1:
+                        var Type? fty = nil
+                        var frebind = false
+                        for tv in osd.type_vars:
+                            if tv.name == fname2:
+                                fty = tv.ty
+                                frebind = tv.mutable and introspect_prim_kind(tv.ty) != ""
+                        if not frebind:
+                            interp.set_pending_throw(Value.Str("field '{fname2}' is not rebindable"))
+                            return Value.Nil
+                        let kind_err = introspect_check_kind(fty, args[0], fname2)
+                        if kind_err != "":
+                            interp.set_pending_throw(Value.Str(kind_err))
+                            return Value.Nil
+                        var Value payload = args[0]
+                        match args[0]:
+                            Value.EnumVariant(_, _, pf):
+                                if pf.length == 1:
+                                    payload = pf[0]
+                            _: nil
+                        type_var_write(interp, fowner, fname2, payload)
+                        return Value.Void
             if inner.type_name == "Field" and method_name == "get" and args.length == 1:
                 guard let fname_v = inner.get_field("name") else: return nil
                 let fname = match fname_v:
@@ -597,12 +797,49 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                             Value.Int(i): return field_value_wrapped(evfields[i])
                             _: return nil
                     _: return nil
+            if inner.type_name == "Method" and method_name == "call" and args.length == 1:
+                guard let owner_v = inner.get_field("__ownerType") else: return nil
+                guard let name_v = inner.get_field("name") else: return nil
+                guard let kind_v = inner.get_field("__kind") else: return nil
+                var string owner = ""
+                var string mname = ""
+                var string mkind = ""
+                match owner_v:
+                    Value.Str(o): owner = o
+                    _: nil
+                match name_v:
+                    Value.Str(n): mname = n
+                    _: nil
+                match kind_v:
+                    Value.Str(k): mkind = k
+                    _: nil
+                if mkind != "type":
+                    return nil
+                mut [Value] call_args = []
+                match args[0]:
+                    Value.Array(items):
+                        for it in items:
+                            match it:
+                                Value.EnumVariant(fvn, _, fvf):
+                                    if fvn == "FieldValue" and fvf.length == 1:
+                                        call_args.push(fvf[0])
+                                    else:
+                                        call_args.push(it)
+                                _: call_args.push(it)
+                    _: nil
+                guard let tdecl = interp.find_best_method("__type__." + owner, mname, call_args) else: throw "Method.call: no type method '{mname}'"
+                let call_res = call_fn(interp, tdecl, call_args, nil)
+                return field_value_wrapped(call_res)
             if method_name == "introspect" and args.length == 0:
                 guard let sd = interp.get_struct_decl(inner.type_name) else: return nil
                 mut flds = []
                 var i = 0
                 for f in sd.fields:
-                    flds.push(introspect_field(f.name, i))
+                    flds.push(introspect_field_full(f.name, i, f.is_pub, true, f.mutable, f.mutable, sd.name, "instance"))
+                    i += 1
+                for tv in sd.type_vars:
+                    let rebindable = tv.mutable and introspect_prim_kind(tv.ty) != ""
+                    flds.push(introspect_field_full(tv.name, i, tv.is_pub, false, false, rebindable, sd.name, "type"))
                     i += 1
                 return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(sd.name)), ("fields", Value.Array(flds)), ("methods", Value.Array(introspect_methods(sd.name, sd.methods, sd.type_methods)))]))
             nil
@@ -997,7 +1234,9 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
         return fs_res
     if let std_res = std_time_method(recv, method_name, args):
         return std_res
-    if method_name == "introspect" or method_name == "get":
+    if let net_res = net_method(interp, recv, method_name, args):
+        return net_res
+    if method_name == "introspect" or method_name == "get" or method_name == "call" or method_name == "set":
         if let intro = introspect_method(interp, recv, method_name, args):
             return intro
     # Optionals are transparent (`T?` is the value or nil): a Rust-style `Option::unwrap_or`
@@ -1101,6 +1340,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Int(s.length)
                 "len":
                     Value.Int(s.length)
+                "count":
+                    Value.Int(s.length)
                 "split":
                     let sep = args[0] else Value.Str("")
                     match sep:
@@ -1113,6 +1354,27 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Str(s.trimStart())
                 "trimEnd":
                     Value.Str(s.trimEnd())
+                "hasPrefix":
+                    let hp = args[0] else Value.Str("")
+                    match hp:
+                        Value.Str(hv): Value.Bool(s.startsWith(hv))
+                        _: throw "hasPrefix: expected string argument"
+                "hasSuffix":
+                    let hs = args[0] else Value.Str("")
+                    match hs:
+                        Value.Str(hv): Value.Bool(s.endsWith(hv))
+                        _: throw "hasSuffix: expected string argument"
+                "replaceAll":
+                    let ra_from = args[0] else Value.Str("")
+                    let ra_to = args[1] else Value.Str("")
+                    match ra_from:
+                        Value.Str(rf):
+                            match ra_to:
+                                Value.Str(rt): Value.Str(s.replace(rf, rt))
+                                _: throw "replaceAll: expected string arguments"
+                        _: throw "replaceAll: expected string arguments"
+                "toString":
+                    Value.Str(s)
                 "startsWith":
                     let arg = args[0] else Value.Str("")
                     match arg:
@@ -1251,6 +1513,12 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         Value.Nil
                     else:
                         Value.Float64(parsed else 0.0)
+                "parseFloat32":
+                    let parsed32 = s.parseFloat()
+                    if parsed32 == nil:
+                        Value.Nil
+                    else:
+                        Value.Float32((parsed32 else 0.0) as float32)
                 "isDigit":
                     Value.Bool(s.length == 1 and s.chars().all((c): c >= "0" and c <= "9"))
                 "isAlpha":
@@ -1262,6 +1530,60 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
 
         Value.Array(arr):
             match method_name:
+                "dedup":
+                    mut dd = []
+                    var di = 0
+                    while di < arr.length:
+                        if di == 0 or not values_equal(arr[di], arr[di - 1]):
+                            dd.push(arr[di])
+                        di = di + 1
+                    Value.Array(dd)
+                "swap":
+                    let sa = args[0] else Value.Int(0)
+                    let sb = args[1] else Value.Int(0)
+                    match sa:
+                        Value.Int(si):
+                            match sb:
+                                Value.Int(sj):
+                                    if si < 0 or si >= arr.length:
+                                        throw "swap: index {si} out of range for array of length {arr.length}"
+                                    if sj < 0 or sj >= arr.length:
+                                        throw "swap: index {sj} out of range for array of length {arr.length}"
+                                    var swapped = arr
+                                    let st_tmp = swapped[si]
+                                    swapped[si] = swapped[sj]
+                                    swapped[sj] = st_tmp
+                                    Value.Array(swapped)
+                                _: throw "swap: expected two indices"
+                        _: throw "swap: expected two indices"
+                "truncate":
+                    let ta = args[0] else Value.Int(0)
+                    match ta:
+                        Value.Int(tn):
+                            mut tr = []
+                            var ti = 0
+                            while ti < arr.length and ti < tn:
+                                tr.push(arr[ti])
+                                ti = ti + 1
+                            Value.Array(tr)
+                        _: throw "truncate: expected a length"
+                "fill":
+                    let fv = args[0] else Value.Nil
+                    mut fl = []
+                    var fi = 0
+                    while fi < arr.length:
+                        fl.push(fv)
+                        fi = fi + 1
+                    Value.Array(fl)
+                "fold":
+                    let fold_init = args[0] else Value.Nil
+                    let fold_fn = args[1] else Value.Nil
+                    var fold_acc = fold_init
+                    var foldi = 0
+                    while foldi < arr.length:
+                        fold_acc = call_value(interp, fold_fn, [fold_acc, arr[foldi]])
+                        foldi = foldi + 1
+                    fold_acc
                 "clear":
                     Value.Array([])
                 "length":
@@ -1716,7 +2038,55 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             i = i + 1
                         max_val
                 "shuffle":
-                    Value.Array(arr)
+                    mut shuf = arr
+                    var seed = 88172645463325252 as uint64
+                    let clock = try? SystemTime.now().durationSince(UNIX_EPOCH)
+                    if let since = clock:
+                        seed = seed ^ (since.asNanos() as uint64)
+                    var si = shuf.length - 1
+                    while si > 0:
+                        seed = seed ^ (seed << 13)
+                        seed = seed ^ (seed >> 7)
+                        seed = seed ^ (seed << 17)
+                        let sj = (seed % ((si + 1) as uint64)) as int
+                        let tmp = shuf[si]
+                        shuf[si] = shuf[sj]
+                        shuf[sj] = tmp
+                        si = si - 1
+                    Value.Array(shuf)
+                "sort":
+                    mut srt = arr
+                    var sa = 1
+                    while sa < srt.length:
+                        var sb = sa
+                        while sb > 0 and value_lt(srt[sb], srt[sb - 1]):
+                            let stmp = srt[sb]
+                            srt[sb] = srt[sb - 1]
+                            srt[sb - 1] = stmp
+                            sb = sb - 1
+                        sa = sa + 1
+                    Value.Array(srt)
+                "find":
+                    let fpred = args[0] else Value.Nil
+                    var fi2 = 0
+                    while fi2 < arr.length:
+                        let fverdict = call_value(interp, fpred, [arr[fi2]])
+                        match fverdict:
+                            Value.Bool(true): return arr[fi2]
+                            _: nil
+                        fi2 = fi2 + 1
+                    Value.Nil
+                "retain":
+                    let pred = args[0] else Value.Nil
+                    mut kept = []
+                    var ri = 0
+                    while ri < arr.length:
+                        let verdict = call_value(interp, pred, [arr[ri]])
+                        match verdict:
+                            Value.Bool(true): kept.push(arr[ri])
+                            _: nil
+                        ri = ri + 1
+                    Value.Array(kept)
                 "distinct":
                     mut result = []
                     var i = 0
@@ -1955,10 +2325,10 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Int(elements.length)
                 "len":
                     Value.Int(elements.length)
-                "contains":
+                "contains" | "has":
                     let val = args[0] else Value.Nil
                     Value.Bool(value_list_contains(elements, val))
-                "add":
+                "add" | "insert":
                     let val = args[0] else Value.Nil
                     if value_list_contains(elements, val):
                         Value.Set(elements)
@@ -2054,6 +2424,16 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
 
         Value.Int(n):
             match method_name:
+                "min":
+                    let mo = args[0] else Value.Nil
+                    match mo:
+                        Value.Int(mv): Value.Int(if mv < n: mv else n)
+                        _: throw "min: expected an int"
+                "max":
+                    let xo = args[0] else Value.Nil
+                    match xo:
+                        Value.Int(xv): Value.Int(if xv > n: xv else n)
+                        _: throw "max: expected an int"
                 "abs":
                     if n < 0:
                         Value.Int(0 - n)
@@ -2228,6 +2608,25 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
 
         Value.Float64(f):
             match method_name:
+                "powi":
+                    let pe = args[0] else Value.Int(0)
+                    match pe:
+                        Value.Int(pn): Value.Float64(f.powi(pn as int32))
+                        _: throw "powi: expected an int exponent"
+                "trunc":
+                    Value.Float64(f.trunc())
+                "fract":
+                    Value.Float64(f.fract())
+                "min":
+                    let mo = args[0] else Value.Nil
+                    match mo:
+                        Value.Float64(mv): Value.Float64(if mv < f: mv else f)
+                        _: throw "min: expected a float"
+                "max":
+                    let xo = args[0] else Value.Nil
+                    match xo:
+                        Value.Float64(xv): Value.Float64(if xv > f: xv else f)
+                        _: throw "max: expected a float"
                 "pow" | "powf":
                     if args.length != 1:
                         throw "pow: expected one numeric exponent"
@@ -2295,6 +2694,15 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
         # f32 precision throughout.
         Value.Float32(f):
             match method_name:
+                "powi":
+                    let pe = args[0] else Value.Int(0)
+                    match pe:
+                        Value.Int(pn): Value.Float32(f.powi(pn as int32))
+                        _: throw "powi: expected an int exponent"
+                "trunc":
+                    Value.Float32(f.trunc())
+                "fract":
+                    Value.Float32(f.fract())
                 "pow" | "powf":
                     if args.length != 1:
                         throw "pow: expected one numeric exponent"

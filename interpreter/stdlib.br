@@ -30,6 +30,13 @@ struct Interpreter:
     # `'observed` subscribers: (wrapper ref id, subscription id, callback).
     var [(int, int, Value)] observed_subs = []
     var int observed_next_id = 0
+    # `std.net` sockets of the guest program, keyed by the `id` field of their `TcpListener`/`TcpStream` object.
+    var Sockets'actor net
+    # `type let|var` values, keyed "Owner::name"; `in_type_setter` stops a `type set` body re-entering itself.
+    var {string=Value} type_var_store = {}
+    var bool in_type_setter = false
+    # Declared (or inferred-optional) type of each `let` name, only used to render `{x:?}` of optionals.
+    var {string=Type} declared_types = {}
     # `use a.b.c` resolution state — a reduced-scope port of the real
     # compiler's `search_paths`/`loaded` (src/interpreter/mod.rs). See
     # `exec_use` below for exactly what's supported.
@@ -698,12 +705,13 @@ def void register_stdlib(mut Interpreter interp):
     env_define(env, "assert_neq", assert_neq_fn, false)
 
     env_define(env, "PI", Value.Float64(3.141592653589793), false)
+    env_define(env, "TAU", Value.Float64(6.283185307179586), false)
     env_define(env, "E", Value.Float64(2.718281828459045), false)
 
-    for math_fn in ["sin", "cos", "tan", "round", "floor", "ceil", "pow", "log", "ln", "log2", "log10", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"]:
+    for math_fn in ["sign", "clamp", "sin", "cos", "tan", "round", "floor", "ceil", "pow", "log", "ln", "log2", "log10", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"]:
         env_define(env, math_fn, Value.NativeFn(math_fn, Value.Nil), false)
 
-    for time_name in ["Duration", "SystemTime", "UNIX_EPOCH", "Box", "Range", "fs"]:
+    for time_name in ["Duration", "SystemTime", "UNIX_EPOCH", "Box", "Range", "fs", "TcpListener", "TcpStream"]:
         env_define(env, time_name, Value.NativeFn(time_name, Value.Nil), false)
 
     let hashmap_fn = Value.NativeFn("HashMap", Value.Nil)
@@ -751,6 +759,10 @@ def Interpreter'actor new_interpreter():
         providers = {},
         observed_subs = [],
         observed_next_id = 0,
+        type_var_store = {},
+        in_type_setter = false,
+        declared_types = {},
+        net = Sockets(listeners = {}, streams = {}, next_id = 0),
         return_ty_stack = [],
         last_var_params = [],
         search_paths = [],
@@ -762,6 +774,21 @@ def Interpreter'actor new_interpreter():
         error_variants.push(EnumVariant(name= name, fields= [], attrs= [], line= 0))
     let error_decl = EnumDecl(name= "Error", is_pub= true, is_native= false, type_params= [], protocols= [], variants= error_variants, methods= [], type_methods= [], setters= [], conversions= [], attrs= [], line= 0)
     exec_item(interp, Item.Enum(error_decl))
+    # Built-in `FieldValue`: the tagged union reflection (`Field.get/set`, `Method.call`) exchanges values through.
+    mut [EnumVariant] fv_variants = []
+    for vname in ["Int", "Float", "Bool", "Str", "Other", "Nested", "Actor", "Guard"]:
+        var Type payload_ty = Type.Named("Introspect")
+        if vname == "Int":
+            payload_ty = Type.Int
+        elif vname == "Float":
+            payload_ty = Type.Float64
+        elif vname == "Bool":
+            payload_ty = Type.Bool
+        elif vname == "Str" or vname == "Other":
+            payload_ty = Type.Str
+        fv_variants.push(EnumVariant(name= vname, fields= [VariantField(name= nil, ty= payload_ty, is_mut= false)], attrs= [], line= 0))
+    let fv_decl = EnumDecl(name= "FieldValue", is_pub= true, is_native= false, type_params= [], protocols= [], variants= fv_variants, methods= [], type_methods= [], setters= [], conversions= [], attrs= [], line= 0)
+    exec_item(interp, Item.Enum(fv_decl))
     interp
 
 # ─── register_free_fn ──────────────────────────────────────────────────────────
@@ -989,8 +1016,49 @@ def void exec_use(mut Interpreter interp, UseDecl decl):
 def void register_type_methods(mut Interpreter interp, string owner, [TypeMethod] methods):
     mut [FnDecl] functions = []
     for m in methods:
+        var is_setter = false
+        match m.kind:
+            TypeMethodKind.Set: is_setter = true
+            _: nil
+        if is_setter:
+            continue
         functions.push(FnDecl(name= m.name, qualifier= nil, params= m.params, return_ty= m.return_ty, body= m.body, is_pub= m.is_pub, can_throw= m.can_throw, is_task= m.is_task, is_stream= false, stream_capacity= nil, mutating= false, is_native= false, throws_ty= nil, type_params= [], where_clause= [], attrs= [], line= m.line))
     interp.set_method_decls("__type__." + owner, functions)
+
+# The `type set <field>` body of `owner`, as a callable function.
+def FnDecl? type_setter_decl(mut Interpreter interp, string owner, string field):
+    guard let sd = interp.get_struct_decl(owner) else: return nil
+    for m in sd.type_methods:
+        var is_setter = false
+        match m.kind:
+            TypeMethodKind.Set: is_setter = true
+            _: nil
+        if is_setter and m.name == field:
+            return FnDecl(name= m.name, qualifier= nil, params= m.params, return_ty= nil, body= m.body, is_pub= m.is_pub, can_throw= m.can_throw, is_task= false, is_stream= false, stream_capacity= nil, mutating= false, is_native= false, throws_ty= nil, type_params= [], where_clause= [], attrs= [], line= m.line)
+    nil
+
+# Writes the type-level field `owner.field`: through its `type set` unless already inside it.
+def void type_var_write(mut Interpreter interp, string owner, string field, Value val):
+    guard let sd = interp.get_struct_decl(owner) else: throw "unknown type '{owner}'"
+    var found = false
+    var mutable = false
+    for tv in sd.type_vars:
+        if tv.name == field:
+            found = true
+            mutable = tv.mutable
+    if not found:
+        throw "no type-level field '{field}' on '{owner}'"
+    if not mutable:
+        throw "cannot assign to 'type let {field}' — use 'type var' for mutable type variables"
+    if not interp.in_type_setter:
+        if let setter = type_setter_decl(interp, owner, field):
+            interp.in_type_setter = true
+            _ = call_fn(interp, setter, [val], nil)
+            interp.in_type_setter = false
+            return
+    mut {string=Value} store = interp.type_var_store
+    store.set(owner + "::" + field, val)
+    interp.type_var_store = store
 
 def void exec_item(mut Interpreter interp, Item item):
     match item:
@@ -1006,6 +1074,11 @@ def void exec_item(mut Interpreter interp, Item item):
             let sname = decl.name
             interp.set_struct_decl(sname, decl)
             register_type_methods(interp, sname, decl.type_methods)
+            for tv in decl.type_vars:
+                let tv_val = eval_expr(interp, tv.default)
+                mut {string=Value} tv_store = interp.type_var_store
+                tv_store.set(sname + "::" + tv.name, tv_val)
+                interp.type_var_store = tv_store
             # Collect own methods into final list; build a comma-separated name index
             mut all_struct_methods = [FnDecl]{}
             var own_names_str = ","

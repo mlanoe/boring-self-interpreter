@@ -1214,6 +1214,29 @@ def TypeMethod parse_type_method(mut Parser p, bool is_pub) throws:
     let kind = if is_def: TypeMethodKind.Def else: TypeMethodKind.Req
     TypeMethod(kind= kind, name= fn_decl.name, params= fn_decl.params, return_ty= fn_decl.return_ty, body= fn_decl.body, is_pub= is_pub, can_throw= fn_decl.can_throw, is_task= fn_decl.is_task, line= fn_decl.line)
 
+# `type let|var [Type] name = expr`: a type-level field (one value per type, `Config.count`).
+def TypeVar parse_type_var(mut Parser p, bool is_pub) throws:
+    let line = p.current_line()
+    _ = p.expect(TokenKind.Type)
+    var mutable = false
+    if p.eat(TokenKind.Var):
+        mutable = true
+    else:
+        _ = p.expect(TokenKind.Let)
+    let ty = parse_type(p)
+    let name_tok = p.expect(TokenKind.Ident(""))
+    _ = p.expect(TokenKind.Eq)
+    let default = parse_expr(p)
+    while p.eat(TokenKind.Newline):
+        nil
+    TypeVar(name= name_tok.text(), ty= ty, default= default, is_pub= is_pub, mutable= mutable, line= line)
+
+# `type set name(T v): body`: the setter every write to the type-level field `name` goes through.
+def TypeMethod parse_type_setter(mut Parser p, bool is_pub) throws:
+    _ = p.expect(TokenKind.Type)
+    let sd = parse_setter_decl(p)
+    TypeMethod(kind= TypeMethodKind.Set, name= sd.name, params= [Param(name= sd.param_name, ty= sd.param_ty, mutable= false, owned= false, variadic= false, default= nil, line= sd.line)], return_ty= nil, body= sd.body, is_pub= is_pub, can_throw= sd.can_throw, is_task= false, line= sd.line)
+
 def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
     let line = p.current_line()
     let decl_attrs = p.pending_attrs
@@ -1244,6 +1267,7 @@ def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
     mut fields = [FieldDecl]{}
     mut methods = [FnDecl]{}
     mut type_methods = [TypeMethod]{}
+    mut type_vars = [TypeVar]{}
     mut inits = [InitDecl]{}
     mut setters = [SetDecl]{}
     mut conversions = [AsDecl]{}
@@ -1277,6 +1301,10 @@ def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
                 elif parser_check(p, "Type"):
                     if parser_token_at_offset_is(p, 1, "Def") or parser_token_at_offset_is(p, 1, "Req"):
                         type_methods.push(parse_type_method(p, true))
+                    elif parser_token_at_offset_is(p, 1, "Let") or parser_token_at_offset_is(p, 1, "Var"):
+                        type_vars.push(parse_type_var(p, true))
+                    elif parser_token_at_offset_is(p, 1, "Set"):
+                        type_methods.push(parse_type_setter(p, true))
                     else:
                         # Public associated type/type variable declaration
                         # (`pub type let T default = ...`). It has no runtime
@@ -1310,6 +1338,10 @@ def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
             TokenKind.Type:
                 if parser_token_at_offset_is(p, 1, "Def") or parser_token_at_offset_is(p, 1, "Req"):
                     type_methods.push(parse_type_method(p, false))
+                elif parser_token_at_offset_is(p, 1, "Let") or parser_token_at_offset_is(p, 1, "Var"):
+                    type_vars.push(parse_type_var(p, false))
+                elif parser_token_at_offset_is(p, 1, "Set"):
+                    type_methods.push(parse_type_setter(p, false))
                 else:
                     # Associated type declaration: `type Output = int`.
                     while p.peek() != TokenKind.Newline and p.peek() != TokenKind.Eof:
@@ -1345,7 +1377,7 @@ def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
             let af = fields[fields.length - 1]
             fields[fields.length - 1] = FieldDecl(name= af.name, is_pub= af.is_pub, ty= af.ty, mutable= af.mutable, is_transient= af.is_transient, default= af.default, attrs= member_attrs, line= af.line)
     _ = p.eat(TokenKind.Dedent)
-    StructDecl(name= name, fields= fields, methods= methods, inits= inits, line= line, is_pub= is_pub, is_native= false, protocols= struct_protocols, conversions= conversions, type_params= [], where_clause= [], setters= setters, type_methods= type_methods, type_vars= [], assoc_type_defs= [], attrs= decl_attrs)
+    StructDecl(name= name, fields= fields, methods= methods, inits= inits, line= line, is_pub= is_pub, is_native= false, protocols= struct_protocols, conversions= conversions, type_params= [], where_clause= [], setters= setters, type_methods= type_methods, type_vars= type_vars, assoc_type_defs= [], attrs= decl_attrs)
 
 def FieldDecl parse_field_decl(mut Parser p) throws:
     let line = p.current_line()
@@ -3417,10 +3449,12 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
             Value.Float64(x):
                 match b:
                     Value.Float64(y): return if x < y: Value.Float64(x) else Value.Float64(y)
+                    Value.Float32(y): return if (x as float32) < y: Value.Float32(x as float32) else Value.Float32(y)
                     _: throw "min: type mismatch"
             Value.Float32(x):
                 match b:
                     Value.Float32(y): return if x < y: Value.Float32(x) else Value.Float32(y)
+                    Value.Float64(y): return if x < (y as float32): Value.Float32(x) else Value.Float32(y as float32)
                     _: throw "min: type mismatch"
             _: throw "min: expected numbers"
     if name == "max":
@@ -3434,10 +3468,12 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
             Value.Float64(x):
                 match b:
                     Value.Float64(y): return if x > y: Value.Float64(x) else Value.Float64(y)
+                    Value.Float32(y): return if (x as float32) > y: Value.Float32(x as float32) else Value.Float32(y)
                     _: throw "max: type mismatch"
             Value.Float32(x):
                 match b:
                     Value.Float32(y): return if x > y: Value.Float32(x) else Value.Float32(y)
+                    Value.Float64(y): return if x > (y as float32): Value.Float32(x) else Value.Float32(y as float32)
                     _: throw "max: type mismatch"
             _: throw "max: expected numbers"
     if name == "exit":
@@ -3530,6 +3566,33 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
             Value.Float16(h): return Value.Float16((h as float32).tan() as float16)
             Value.Int(n): return Value.Float64(float(n).tan())
             _: throw "tan: expected number"
+    if name == "sign":
+        let v = args[0] else Value.Nil
+        match v:
+            Value.Float64(f): return Value.Float64(if f > 0.0: 1.0 elif f < 0.0: -1.0 else 0.0)
+            Value.Float32(f): return Value.Float32(if f > 0.0: 1.0 elif f < 0.0: -1.0 else 0.0)
+            Value.Int(n): return Value.Int(if n > 0: 1 elif n < 0: -1 else 0)
+            _: throw "sign: expected number"
+    if name == "clamp" and args.length == 3:
+        let cv = args[0] else Value.Nil
+        let clo = args[1] else Value.Nil
+        let chi = args[2] else Value.Nil
+        match cv:
+            Value.Int(n):
+                match clo:
+                    Value.Int(lo):
+                        match chi:
+                            Value.Int(hi): return Value.Int(if n < lo: lo elif n > hi: hi else n)
+                            _: nil
+                    _: nil
+            _: nil
+        guard let cf = value_as_float64_widened(cv) else: throw "clamp: expected numbers"
+        guard let lof = value_as_float64_widened(clo) else: throw "clamp: expected numbers"
+        guard let hif = value_as_float64_widened(chi) else: throw "clamp: expected numbers"
+        let clamped = if cf < lof: lof elif cf > hif: hif else cf
+        match cv:
+            Value.Float32(_): return Value.Float32(clamped as float32)
+            _: return Value.Float64(clamped)
     if name == "round":
         let v = args[0] else Value.Nil
         match v:

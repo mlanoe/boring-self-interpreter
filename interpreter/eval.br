@@ -321,6 +321,36 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     let swap_new = eval_expr(interp, args[0].value)
                     assign_target(interp, recv_expr, swap_new)
                     return recv
+            # `stream.read(buf)` / `stream.read_exact(buf)`: refill the caller's buffer in place.
+            if (method == "read" or method == "read_exact" or method == "readExact") and args.length == 1:
+                let rbuf = eval_expr(interp, args[0].value)
+                if let rres = net_read(interp, recv, rbuf, method != "read"):
+                    if interp.has_pending_throw:
+                        return Value.Nil
+                    assign_target(interp, args[0].value, rres.0)
+                    return rres.1
+            # `arr.drain(range)`: removes the range from the receiver, returns what was removed.
+            if method == "drain" and args.length == 1:
+                match recv:
+                    Value.Array(darr):
+                        match eval_expr(interp, args[0].value):
+                            Value.Range(rs, re, rincl, _):
+                                let rend = if rincl: re + 1 else re
+                                if rs < 0 or rend > darr.length or rs > rend:
+                                    throw "drain: range {rs}..{rend} out of bounds for array of length {darr.length}"
+                                mut removed = []
+                                mut remaining = []
+                                var di = 0
+                                while di < darr.length:
+                                    if di >= rs and di < rend:
+                                        removed.push(darr[di])
+                                    else:
+                                        remaining.push(darr[di])
+                                    di = di + 1
+                                assign_target(interp, recv_expr, Value.Array(remaining))
+                                return Value.Array(removed)
+                            _: nil
+                    _: nil
             check_mutating_method_call(interp, recv_expr, recv, method)
             let hints = method_hint_types(interp, recv, method, args.length)
             var mut arg_vals = eval_args_with_hints(interp, args, hints)
@@ -378,10 +408,15 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     Value.Set(_):
                         assign_target(interp, recv_expr, result)
                     _: nil
-            elif method == "push" or method == "append" or method == "insert" or method == "move" or method == "removeIndices":
+            elif method == "push" or method == "append" or method == "insert" or method == "move" or method == "removeIndices" or method == "dedup" or method == "swap" or method == "truncate" or method == "fill" or method == "retain" or method == "shuffle" or method == "sort":
                 # Collection write-back belongs to the receiver, not to every
                 # user method with the same name and a collection return value.
                 match recv:
+                    Value.Set(_):
+                        if method == "insert":
+                            match result:
+                                Value.Set(_): assign_target(interp, recv_expr, result)
+                                _: nil
                     Value.Array(_):
                         match result:
                             Value.Array(_): assign_target(interp, recv_expr, result)
@@ -420,6 +455,12 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         throw "{cfmt.name()} has no member '{field_name}'"
                 _: nil
             let obj = eval_expr(interp, obj_expr)
+            # `Config.count`: a type-level field.
+            match obj:
+                Value.StructDef(tv_owner):
+                    if let tv_val = interp.type_var_store.get(tv_owner + "::" + field_name):
+                        return tv_val
+                _: nil
             # `self.<state field>` inside a `view` method reads the mounted state (`__st`).
             match obj_expr.kind:
                 ExprKind.Var(self_nm):
@@ -530,6 +571,18 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         # Array literal
         ExprKind.Array(elems):
+            # `[TypeName]{}`: the typed-empty-array idiom. The parser splits it into `[T]` + `{}`,
+            # so a one-element literal naming a struct/enum type is the empty array.
+            if elems.length == 1:
+                match elems[0].kind:
+                    ExprKind.Var(tn):
+                        let tv = interp.current_env.get(tn)
+                        if let tval = tv:
+                            match tval:
+                                Value.StructDef(_): return Value.Array([])
+                                Value.EnumDef(_): return Value.Array([])
+                                _: nil
+                    _: nil
             mut vals = []
             for item in elems:
                 vals.push(eval_expr(interp, item))
@@ -718,7 +771,14 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         result = result + display_value(interp, v)
                     StringSegment.FormattedExpr(e, fmt_spec):
                         let v = eval_expr(interp, e)
-                        result = result + format_value(interp, v, fmt_spec)
+                        var typed_done = false
+                        if fmt_spec.endsWith("?"):
+                            if let sty = static_type_of(interp, e):
+                                if type_has_optional(interp, sty, 0):
+                                    result = result + format_typed(interp, v, sty, fmt_spec)
+                                    typed_done = true
+                        if not typed_done:
+                            result = result + format_value(interp, v, fmt_spec)
             Value.Str(result)
 
         # Closure
@@ -2970,6 +3030,143 @@ def Value cast_value(mut Interpreter interp, Value val0, Type ty):
                 _:
                     throw "unknown cast target type '{type_name}'"
 
+# ─── `{x:?}` of optionals ─────────────────────────────────────────────────────
+# Optionals are transparent at run time (`T?` is the value or nil), so `Some(v)`/`None` comes
+# from the static type of the hole: a declared `let`, a struct field, an element, a built-in
+# optional-returning call, or a function's return type.
+
+def bool expr_is_builtin_optional(Expr e):
+    match e.kind:
+        ExprKind.MethodCall(_, name, _):
+            name == "first" or name == "last" or name == "find" or name == "indexOf" or name == "parseInt" or name == "parseFloat" or name == "parseFloat32"
+        _: false
+
+def Type? static_type_of(mut Interpreter interp, Expr e):
+    match e.kind:
+        ExprKind.Var(n):
+            interp.declared_types.get(n)
+        ExprKind.Field(obj, fname):
+            guard let ov = eval_expr(interp, obj) as Value? else: return nil
+            match ov:
+                Value.Object(inner):
+                    guard let sd = interp.get_struct_decl(inner.type_name) else: return nil
+                    for f in sd.fields:
+                        if f.name == fname:
+                            return f.ty
+                    nil
+                _: nil
+        ExprKind.Index(arr, _):
+            guard let aty0 = static_type_of(interp, arr) else: return nil
+            var aty = aty0
+            while true:
+                match aty:
+                    Type.Qualified(qi, _): aty = qi
+                    _: break
+            match aty:
+                Type.Array(elem): elem
+                Type.Dict(_, dv): dv
+                _: nil
+        ExprKind.MethodCall(recv, mname, _):
+            if expr_is_builtin_optional(e):
+                return Type.Optional(Type.Named("_"))
+            # `get(k)` of a dict is an optional; a user method of that name is not.
+            if mname == "get":
+                let rv = eval_expr(interp, recv)
+                match rv:
+                    Value.Dict(_):
+                        if mname == "get":
+                            return Type.Optional(Type.Named("_"))
+                    _: nil
+            nil
+        ExprKind.Call(callee, _):
+            match callee.kind:
+                ExprKind.Var(fname):
+                    if let fd = interp.get_fn_decl(fname):
+                        return fd.return_ty
+                    nil
+                _: nil
+        _: nil
+
+def bool type_has_optional(mut Interpreter interp, Type ty, int depth):
+    if depth > 4:
+        return false
+    match ty:
+        Type.Optional(_): true
+        Type.Qualified(inner, _): type_has_optional(interp, inner, depth + 1)
+        Type.Array(elem): type_has_optional(interp, elem, depth + 1)
+        Type.Set(elem): type_has_optional(interp, elem, depth + 1)
+        Type.Tuple(ts):
+            for t in ts:
+                if type_has_optional(interp, t, depth + 1):
+                    return true
+            false
+        Type.Dict(k, v): type_has_optional(interp, k, depth + 1) or type_has_optional(interp, v, depth + 1)
+        Type.Named(n):
+            if let sd = interp.get_struct_decl(n):
+                for f in sd.fields:
+                    if type_has_optional(interp, f.ty, depth + 1):
+                        return true
+            false
+        _: false
+
+# Rust-`Debug` rendering of `val` guided by its declared type; `spec` carries width/fill for payloads.
+def string format_typed(mut Interpreter interp, Value val, Type ty, string spec):
+    match ty:
+        Type.Optional(inner):
+            match val:
+                Value.Nil: return "None"
+                _: return "Some(" + format_typed(interp, val, inner, spec) + ")"
+        Type.Qualified(inner, _): return format_typed(interp, val, inner, spec)
+        Type.Array(elem):
+            match val:
+                Value.Array(items):
+                    mut parts = []
+                    for it in items:
+                        parts.push(format_typed(interp, it, elem, spec))
+                    return "[" + parts.join(", ") + "]"
+                _: nil
+        Type.Set(elem):
+            match val:
+                Value.Set(items):
+                    mut parts = []
+                    for it in items:
+                        parts.push(format_typed(interp, it, elem, spec))
+                    return "{{" + parts.join(", ") + "}}"
+                _: nil
+        Type.Tuple(ts):
+            match val:
+                Value.Tuple(items):
+                    mut parts = []
+                    var ti = 0
+                    while ti < items.length:
+                        if ti < ts.length:
+                            parts.push(format_typed(interp, items[ti], ts[ti], spec))
+                        else:
+                            parts.push(debug_value(interp, items[ti]))
+                        ti = ti + 1
+                    return "(" + parts.join(", ") + ")"
+                _: nil
+        Type.Dict(kt, vt):
+            match val:
+                Value.Dict(entries):
+                    mut parts = []
+                    for en in entries:
+                        parts.push(format_typed(interp, en.0, kt, spec) + ": " + format_typed(interp, en.1, vt, spec))
+                    return "{{" + parts.join(", ") + "}}"
+                _: nil
+        Type.Named(n):
+            match val:
+                Value.Object(inner):
+                    if let sd = interp.get_struct_decl(inner.type_name):
+                        mut parts = []
+                        for f in sd.fields:
+                            if let fv = inner.get_field(f.name):
+                                parts.push("{f.name}: " + format_typed(interp, fv, f.ty, spec))
+                        return "{inner.type_name} {{ " + parts.join(", ") + " }}"
+                _: nil
+        _: nil
+    format_value(interp, val, spec)
+
 # Apply a format spec string to a value
 req string format_value(Interpreter interp, Value val, string spec):
     if spec == "":
@@ -2988,6 +3185,11 @@ req string format_value(Interpreter interp, Value val, string spec):
         i += 1
     if i < n and chars[i] == "0":
         flag_zero = true
+        i += 1
+    # Parse alignment (`>` is the default for padding, `<` pads on the right)
+    var align_left = false
+    if i < n and (chars[i] == ">" or chars[i] == "<"):
+        align_left = chars[i] == "<"
         i += 1
     # Parse width
     while i < n and chars[i] >= "0" and chars[i] <= "9":
@@ -3072,6 +3274,8 @@ req string format_value(Interpreter interp, Value val, string spec):
             pi += 1
         if flag_zero and (raw.startsWith("-") or raw.startsWith("+")):
             raw = raw.slice(0, 1) + pad + raw.slice(1, raw.length)
+        elif align_left:
+            raw = raw + pad
         else:
             raw = pad + raw
     raw
@@ -3720,6 +3924,11 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                     throw "cannot assign to immutable variable '{name}'"
         ExprKind.Field(obj_expr, field_name):
             let obj = eval_expr(interp, obj_expr)
+            match obj:
+                Value.StructDef(tv_owner):
+                    type_var_write(interp, tv_owner, field_name, val)
+                    return
+                _: nil
             match obj:
                 Value.Object(inner):
                     # Check for a setter method

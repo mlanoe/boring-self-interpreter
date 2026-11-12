@@ -1459,6 +1459,18 @@ def Stmt parse_stmt(mut Parser p) throws:
             parser_skip_newlines(p)
         return stmt_expr(task_expr, task_expr.line)
     let line = parser_line(p)
+    # `print -x` / `write -x`: a print of a negative value, not the subtraction `print - x`.
+    let cmd_name = parser_peek_ident(p)
+    if (cmd_name == "print" or cmd_name == "write" or cmd_name == "println") and parser_peek_next_is(p, "Minus"):
+        parser_advance(p)
+        mut cmd_args = []
+        while true:
+            let cmd_arg = parse_or(p)
+            cmd_args.push(make_arg(nil, cmd_arg, false, false))
+            if not parser_eat(p, "Comma"):
+                break
+        parser_expect_newline(p)
+        return stmt_expr(make_call(make_var_expr(cmd_name, line), cmd_args, line), line)
     let lhs = parse_expr(p)
     if parser_eat(p, "Eq"):
         let rhs = parse_else_expr(p)

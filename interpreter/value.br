@@ -3,6 +3,9 @@
 
 # == VALUE AND ENV ==
 
+use std.net.TcpListener, TcpStream
+use std.io.Read, Write
+
 # ─── Signal ───────────────────────────────────────────────────────────────────
 
 enum Signal:
@@ -145,6 +148,74 @@ enum Value:
             Value.EnumDef(n): "enum:{n}"
 
 # ─── Env ──────────────────────────────────────────────────────────────────────
+
+# `std.net` sockets of the guest program (`TcpListener`/`TcpStream` are not `Clone`, so they
+# live here, behind an actor handle, and the guest objects only carry an `id`).
+struct Sockets:
+    var {int=TcpListener} listeners
+    var {int=TcpStream} streams
+    var int next_id
+
+    def int bind(string addr) throws:
+        let r = try? TcpListener.bind(addr)
+        guard let listener = r else throw "bind failed"
+        self.next_id = self.next_id + 1
+        self.listeners.set(self.next_id, listener)
+        self.next_id
+
+    def int connect(string addr) throws:
+        let r = try? TcpStream.connect(addr)
+        guard let st = r else throw "connect failed"
+        self.next_id = self.next_id + 1
+        self.streams.set(self.next_id, st)
+        self.next_id
+
+    def string listenerAddr(int id) throws:
+        let r = try? self.listeners[id].local_addr()
+        guard let a = r else throw "local_addr failed"
+        "{a}"
+
+    def (int, string) accept(int id) throws:
+        let r = try? self.listeners[id].accept()
+        guard let pair = r else throw "accept failed"
+        var TcpStream st = pair.0
+        let a = pair.1
+        self.next_id = self.next_id + 1
+        self.streams.set(self.next_id, st)
+        (self.next_id, "{a}")
+
+    def int writeBytes(int id, [uint8] bytes, bool all) throws:
+        if all:
+            let ok = try? self.streams[id].write_all(bytes)
+            guard let _ = ok else throw "write failed"
+            return bytes.length
+        let r = try? self.streams[id].write(bytes)
+        guard let n = r else throw "write failed"
+        n as int
+
+    def void flush(int id) throws:
+        let ok = try? self.streams[id].flush()
+        guard let _ = ok else throw "flush failed"
+
+    def string streamAddr(int id, bool peer) throws:
+        if peer:
+            let p = try? self.streams[id].peer_addr()
+            guard let pa = p else throw "peer_addr failed"
+            return "{pa}"
+        let l = try? self.streams[id].local_addr()
+        guard let la = l else throw "local_addr failed"
+        "{la}"
+
+    # Fills a copy of `buf`; returns it with the byte count (0 for `read_exact`).
+    def ([uint8], int) readInto(int id, [uint8] buf, bool exact) throws:
+        var mut [uint8] bytes = buf
+        if exact:
+            let ok = try? self.streams[id].read_exact(bytes)
+            guard let _ = ok else throw "read_exact failed"
+            return (bytes, 0)
+        let r = try? self.streams[id].read(bytes)
+        guard let n = r else throw "read failed"
+        (bytes, n as int)
 
 struct Env:
     var {string=Value} vars
