@@ -152,6 +152,12 @@ struct Env:
     {string} lazy_vars
     Env'actor? parent
 
+    req [Value] local_values():
+        mut [Value] out = []
+        for k in self.vars.keys():
+            out.push(self.vars[k])
+        out
+
     req Value? get(string name):
         if self.vars.has(name):
             self.vars[name]

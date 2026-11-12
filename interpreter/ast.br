@@ -537,6 +537,7 @@ enum OwnerQual:
     Weak
     Inline
     Static
+    Observed
     Lifetime(string name)
     BorrowShared
     Borrow

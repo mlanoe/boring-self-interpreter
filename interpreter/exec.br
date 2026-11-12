@@ -223,6 +223,8 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
                 # already recognizes these annotations, but nothing applied them at runtime.
                 if let declared_ty = s.ty:
                     check_fixed_declared(declared_ty, expr, val, "assign", s.name)
+                    if type_is_observed(declared_ty):
+                        val = coerce_declared_value(interp, val, declared_ty)
                     match declared_ty:
                         Type.Uint:
                             match val:
@@ -682,6 +684,7 @@ def Signal? exec_if(mut Interpreter interp, IfStmt s):
             let prev = interp.current_env
             interp.current_env = child
             let sig = exec_block(interp, branch.body)
+            drop_scope_subscriptions(interp, child, -1)
             interp.current_env = prev
             return sig
     if let else_body = s.else_body:
@@ -1075,6 +1078,15 @@ def [Value] exec_stream_fn(mut Interpreter interp, [Stmt] stmts):
         _: nil
     result
 
+# `T'...'observed` (the outermost qualifier is `'observed`).
+def bool type_is_observed(Type ty):
+    match ty:
+        Type.Qualified(inner, qual):
+            match qual:
+                OwnerQual.Observed: true
+                _: type_is_observed(inner)
+        _: false
+
 # Does an attribute list carry `@name`?
 def bool attrs_have([Attr] attrs, string name):
     for a in attrs:
@@ -1161,7 +1173,8 @@ def Value call_fn_body(mut Interpreter interp, FnDecl decl, [Value] args, Env'ac
                     coerce_array_elements(interp, val, ty)
                 else:
                     coerce_declared_value(interp, val, ty)
-                fn_env.force_set(param_name, coerced)
+                fn_env.force_set(param_name, coerced.clone())
+                mark_byvalue_param(interp, param, coerced)
     let prev_env = interp.current_env
     interp.current_env = fn_env
     # Push this call's declared return type so `return .Left` (exec_stmt's Return case)
@@ -1180,6 +1193,7 @@ def Value call_fn_body(mut Interpreter interp, FnDecl decl, [Value] args, Env'ac
         return Value.Array(stream_result)
     let sig = exec_block_fn(interp, decl.body)
     capture_var_param_outs(interp, decl.params, fn_env)
+    drop_scope_subscriptions(interp, fn_env, -1)
     pop_return_ty(interp)
     interp.current_env = prev_env
     match sig:

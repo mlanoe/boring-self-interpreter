@@ -852,7 +852,105 @@ def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInn
         return call_method(interp, self_val, "body", body_args)
     nil
 
+# A plain (unqualified) struct parameter that is not `mut`/`var` is passed by value: storing it
+# (`field = p`, `arr.push(p)`, `d[k] = p`) stores a copy, so later writes by the caller to its own
+# variable stay invisible. The parameter is tagged with a hidden `__bv_<name>` marker.
+def void mark_byvalue_param(mut Interpreter interp, Param param, Value bound):
+    if param.mutable:
+        return
+    if let pty = param.ty:
+        match pty:
+            Type.Named(tn):
+                match bound:
+                    Value.Object(_):
+                        if let _ = interp.get_struct_decl(tn):
+                            env_define(interp, "__bv_{param.name}", Value.Bool(true), false)
+                    _: nil
+            _: nil
+
+# The value to store when `e` is such a by-value parameter: a copy; anything else unchanged.
+def Value byvalue_store(mut Interpreter interp, Expr e, Value v):
+    match e.kind:
+        ExprKind.Var(vname):
+            match v:
+                Value.Object(_):
+                    let flag = interp.current_env.get("__bv_{vname}")
+                    if let _ = flag:
+                        return clone_value(interp, v)
+                _: nil
+        _: nil
+    v
+
+# ─── `'observed` ──────────────────────────────────────────────────────────────
+#
+# A `T'...'observed` value lives in a `__Observed` wrapper (field `value`): `subscribe(cb)` registers
+# a callback and returns a `__Subscription` handle, any other method is forwarded to the wrapped
+# value and a mutating (`def`) one then notifies every subscriber with the wrapper. `.value.m()`
+# reaches the wrapped value directly and never notifies.
+
+def Value make_observed(mut Interpreter interp, Value inner_val):
+    let ref_id = interp.next_ref_id
+    interp.next_ref_id = ref_id + 1
+    Value.Object(ObjectInner(type_name= "__Observed", fields= [("value", inner_val), ("__ref_id", Value.Int(ref_id))]))
+
+# Ends the subscriptions whose handle is bound directly in `env` (their `Drop`), except `keep`.
+def void drop_scope_subscriptions(mut Interpreter interp, Env'actor env, int keep):
+    if interp.observed_subs.length == 0:
+        return
+    for v in env.local_values():
+        match v:
+            Value.Object(so):
+                if so.type_name == "__Subscription":
+                    if let idv = so.get_field("id"):
+                        match idv:
+                            Value.Int(sid):
+                                if sid != keep:
+                                    mut [(int, int, Value)] remaining = []
+                                    for sub in interp.observed_subs:
+                                        if sub.1 != sid:
+                                            remaining.push(sub)
+                                    interp.observed_subs = remaining
+                            _: nil
+            _: nil
+
+def Value observed_method(mut Interpreter interp, Value wrapper, ObjectInner'actor w, string method_name, [Value] args):
+    var target = -1
+    if let tv = w.get_field("__ref_id"):
+        match tv:
+            Value.Int(tid): target = tid
+            _: nil
+    if method_name == "subscribe" and args.length == 1:
+        let sub_id = interp.observed_next_id + 1
+        interp.observed_next_id = sub_id
+        mut [(int, int, Value)] subs = interp.observed_subs
+        subs.push((target, sub_id, args[0]))
+        interp.observed_subs = subs
+        return Value.Object(ObjectInner(type_name= "__Subscription", fields= [("id", Value.Int(sub_id)), ("target", Value.Int(target))]))
+    let inner_v = w.get_field("value") else Value.Nil
+    var mutating = false
+    match inner_v:
+        Value.Object(io):
+            if let sd = interp.get_struct_decl(io.type_name):
+                for md in sd.methods:
+                    if md.name == method_name and md.mutating and not md.is_task:
+                        mutating = true
+        _: nil
+    let result = call_method(interp, inner_v, method_name, args)
+    if mutating:
+        var mut [Value] callbacks = []
+        for sub in interp.observed_subs:
+            if sub.0 == target:
+                callbacks.push(sub.2)
+        for cb in callbacks:
+            _ = call_value(interp, cb, [wrapper.clone()])
+    result
+
 def Value call_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
+    match recv:
+        Value.Object(observed_w):
+            if observed_w.type_name == "__Observed":
+                return observed_method(interp, recv, observed_w, method_name, args)
+        _: nil
     match recv:
         Value.Fixed(fraw, fsg, fn_, fm):
             if let fres = fixed_method(fraw, FixedFmt(signed = fsg, n = fn_, m = fm), method_name, args):
@@ -2318,6 +2416,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     if let param_ty = param.ty:
                         bound_arg = coerce_declared_value(interp, bound_arg, param_ty)
                     env_define(interp, param.name, bound_arg, param.mutable)
+                    mark_byvalue_param(interp, param, bound_arg)
                     i += 1
                 let mutating = method_decl.mutating
                 let method_params = method_decl.params
@@ -2364,6 +2463,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 view_sync(interp, self_val.clone(), true, 1)
                 if let vs2 = view_state_opt:
                     view_sync(interp, vs2, false, 1)
+                drop_scope_subscriptions(interp, interp.current_env, -1)
                 pop_scope(interp)
                 if let fst = forwarded_st:
                     view_sync(interp, fst, false, 2)
@@ -2422,6 +2522,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     if let param_ty = param.ty:
                         bound_arg = coerce_declared_value(interp, bound_arg, param_ty)
                     env_define(interp, param.name, bound_arg, param.mutable)
+                    mark_byvalue_param(interp, param, bound_arg)
                     i += 1
                 let method_params = method_decl.params
                 let result = exec_method_body(interp, method_decl)

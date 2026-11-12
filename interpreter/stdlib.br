@@ -27,6 +27,9 @@ struct Interpreter:
     var {string=Value} singletons = {}
     # `@provide` functions: provided type name -> function name (dependency injection, `@inject`).
     var {string=string} providers = {}
+    # `'observed` subscribers: (wrapper ref id, subscription id, callback).
+    var [(int, int, Value)] observed_subs = []
+    var int observed_next_id = 0
     # `use a.b.c` resolution state — a reduced-scope port of the real
     # compiler's `search_paths`/`loaded` (src/interpreter/mod.rs). See
     # `exec_use` below for exactly what's supported.
@@ -746,6 +749,8 @@ def Interpreter'actor new_interpreter():
         cli_args = [],
         singletons = {},
         providers = {},
+        observed_subs = [],
+        observed_next_id = 0,
         return_ty_stack = [],
         last_var_params = [],
         search_paths = [],

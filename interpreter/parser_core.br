@@ -3748,7 +3748,7 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
         "weak": OwnerQual.Weak
         "one": OwnerQual.Inline
         "many": OwnerQual.Shared
-        "observed": OwnerQual.Shared
+        "observed": OwnerQual.Observed
         _: OwnerQual.Actor
     var qualified = Type.Qualified(base, qual)
     # Allow chained qualifiers: 'T'shared'weak
@@ -3777,7 +3777,7 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
                 "owned": OwnerQual.Owned
                 "new": OwnerQual.Owned
                 "weak": OwnerQual.Weak
-                "observed": OwnerQual.Shared
+                "observed": OwnerQual.Observed
                 _: OwnerQual.Weak
             qualified = Type.Qualified(qualified, q2)
         else:

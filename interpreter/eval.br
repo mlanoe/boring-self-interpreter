@@ -323,7 +323,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     return recv
             check_mutating_method_call(interp, recv_expr, recv, method)
             let hints = method_hint_types(interp, recv, method, args.length)
-            let arg_vals = eval_args_with_hints(interp, args, hints)
+            var mut arg_vals = eval_args_with_hints(interp, args, hints)
+            # Storing a by-value struct parameter into a collection stores a copy.
+            if method == "push" or method == "add" or method == "append" or method == "insert" or method == "set" or method == "put":
+                var ai = 0
+                while ai < args.length and ai < arg_vals.length:
+                    arg_vals[ai] = byvalue_store(interp, args[ai].value, arg_vals[ai])
+                    ai = ai + 1
             interp.last_var_params = []
             let recv_is_self = is_self_var(recv_expr)
             # `self.m()` from inside a method: the caller's field bindings (injected by
@@ -781,7 +787,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             result_val
 
         ExprKind.Assign(target, val_expr):
-            let val = eval_expr(interp, val_expr)
+            let val0 = eval_expr(interp, val_expr)
+            let val = byvalue_store(interp, val_expr, val0)
             # `g = f` / `p.v = f` where the slot holds a fixed-point value: only an
             # untyped literal may adopt its format.
             match val:
@@ -2573,7 +2580,21 @@ def Value coerce_declared_value(mut Interpreter interp, Value val, Type ty):
         Value.Uninitialized: return val
         _: nil
     match ty:
-        Type.Qualified(inner, _): coerce_declared_value(interp, val, inner)
+        Type.Qualified(inner, qual):
+            match qual:
+                OwnerQual.Observed:
+                    # `T'...'observed`: the value lives in an `__Observed` wrapper.
+                    var already = false
+                    match val:
+                        Value.Object(wo):
+                            if wo.type_name == "__Observed":
+                                already = true
+                        _: nil
+                    if already:
+                        val
+                    else:
+                        make_observed(interp, coerce_declared_value(interp, val, inner))
+                _: coerce_declared_value(interp, val, inner)
         Type.Optional(inner): coerce_declared_value(interp, val, inner)
         Type.Array(inner): coerce_array_elements(interp, val, inner)
         Type.ArrayN(inner, _): coerce_array_elements(interp, val, inner)
