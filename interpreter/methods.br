@@ -893,7 +893,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         _: Value.Nil
                 "contains":
                     let target = args[0] else Value.Nil
-                    Value.Bool(arr.contains(target))
+                    Value.Bool(value_list_contains(arr, target))
                 "map":
                     let closure = args[0] else Value.Nil
                     mut result = []
@@ -1074,7 +1074,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var found_idx = Value.Nil
                     var i = 0
                     while i < arr.length and found_idx == Value.Nil:
-                        if arr[i] == target:
+                        if values_equal(arr[i], target):
                             found_idx = Value.Int(i)
                         i = i + 1
                     found_idx
@@ -1298,7 +1298,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var i = 0
                     while i < pairs.length:
                         let pair = pairs[i]
-                        if pair.0 == key:
+                        if values_equal(pair.0, key):
                             found = pair.1
                         i = i + 1
                     found
@@ -1310,7 +1310,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var i = 0
                     while i < new_pairs.length:
                         let pair = new_pairs[i]
-                        if pair.0 == key:
+                        if values_equal(pair.0, key):
                             update_idx = i
                         i = i + 1
                     if update_idx >= 0:
@@ -1326,7 +1326,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var i = 0
                     while i < new_pairs.length:
                         let pair = new_pairs[i]
-                        if pair.0 == key:
+                        if values_equal(pair.0, key):
                             update_idx = i
                         i = i + 1
                     if update_idx >= 0:
@@ -1339,7 +1339,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var found = false
                     var i = 0
                     while i < pairs.length:
-                        if pairs[i].0 == key:
+                        if values_equal(pairs[i].0, key):
                             found = true
                         i = i + 1
                     Value.Bool(found)
@@ -1348,7 +1348,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var found = false
                     var i = 0
                     while i < pairs.length:
-                        if pairs[i].0 == key:
+                        if values_equal(pairs[i].0, key):
                             found = true
                         i = i + 1
                     Value.Bool(found)
@@ -1471,10 +1471,10 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Int(elements.length)
                 "contains":
                     let val = args[0] else Value.Nil
-                    Value.Bool(elements.contains(val))
+                    Value.Bool(value_list_contains(elements, val))
                 "add":
                     let val = args[0] else Value.Nil
-                    if elements.contains(val):
+                    if value_list_contains(elements, val):
                         Value.Set(elements)
                     else:
                         var result = elements
@@ -1485,7 +1485,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     mut result = []
                     var i = 0
                     while i < elements.length:
-                        if elements[i] != val:
+                        if not values_equal(elements[i], val):
                             result.push(elements[i])
                         i = i + 1
                     Value.Set(result)
@@ -1518,7 +1518,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     mut result = []
                     var i = 0
                     while i < elements.length:
-                        if other.contains(elements[i]):
+                        if value_list_contains(other, elements[i]):
                             result.push(elements[i])
                         i = i + 1
                     Value.Set(result)
@@ -1531,7 +1531,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     mut result = []
                     var i = 0
                     while i < elements.length:
-                        if not other.contains(elements[i]):
+                        if not value_list_contains(other, elements[i]):
                             result.push(elements[i])
                         i = i + 1
                     Value.Set(result)
@@ -1544,7 +1544,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var all_in = true
                     var i = 0
                     while i < elements.length and all_in:
-                        if not other.contains(elements[i]):
+                        if not value_list_contains(other, elements[i]):
                             all_in = false
                         i = i + 1
                     Value.Bool(all_in)
@@ -1557,7 +1557,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var all_in = true
                     var i = 0
                     while i < other.length and all_in:
-                        if not elements.contains(other[i]):
+                        if not value_list_contains(elements, other[i]):
                             all_in = false
                         i = i + 1
                     Value.Bool(all_in)

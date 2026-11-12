@@ -658,7 +658,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut vals = []
             for item in elems:
                 let v = eval_expr(interp, item)
-                if not vals.contains(v):
+                if not value_list_contains(vals, v):
                     vals.push(v)
             Value.Set(vals)
 
@@ -824,7 +824,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                     var found = Value.Nil
                                     var has = false
                                     for entry in entries:
-                                        if entry.0 == idx:
+                                        if values_equal(entry.0, idx):
                                             found = entry.1
                                             has = true
                                     if has:
@@ -2473,7 +2473,7 @@ def Value get_index(mut Interpreter interp, Value obj, Value idx):
             throw "labeled array requires labeled indexing (a[width = w, ...]), not a bare index — use .flatten() first for positional access"
         Value.Dict(entries):
             for entry in entries:
-                if entry.0 == idx:
+                if values_equal(entry.0, idx):
                     return entry.1
             Value.Nil
         Value.Str(s):
@@ -3215,7 +3215,17 @@ def Value eval_block(mut Interpreter interp, [Stmt] stmts):
         if i == stmts.length - 1:
             last = eval_stmt_as_expr(interp, stmt)
         else:
-            exec_stmt(interp, stmt)
+            # A `return`/`throw` raised by a non-tail statement (e.g. `if let x: return ...`)
+            # ends the block: expose it as a pending return/throw for the caller.
+            let sig = exec_stmt(interp, stmt)
+            match sig:
+                ReturnSignal(rv):
+                    interp.set_pending_return(rv)
+                    return Value.Nil
+                ThrowSignal(tv):
+                    interp.set_pending_throw(tv)
+                    return Value.Nil
+                _: nil
         i = i + 1
     last
 
@@ -3611,7 +3621,7 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                     var found = false
                     var di = 0
                     while di < new_entries.length:
-                        if new_entries[di].0 == idx:
+                        if values_equal(new_entries[di].0, idx):
                             new_entries[di] = (idx, val)
                             found = true
                         di = di + 1

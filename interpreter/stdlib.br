@@ -372,6 +372,16 @@ def bool val_to_bool(Value v):
 
 # ─── values_equal ─────────────────────────────────────────────────────────────
 
+# Structural membership: `[Value].contains` would use the derived equality of `Value`,
+# which treats two equal user structs as different objects.
+def bool value_list_contains([Value] xs, Value v):
+    var i = 0
+    while i < xs.length:
+        if values_equal(xs[i], v):
+            return true
+        i = i + 1
+    false
+
 def bool values_equal(Value a, Value b):
     match a:
         Value.Nil:

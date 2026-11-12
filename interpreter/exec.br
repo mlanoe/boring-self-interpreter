@@ -106,6 +106,14 @@ def Signal? exec_if_as_expr(mut Interpreter interp, IfStmt s):
 def Signal? exec_match_as_expr(mut Interpreter interp, MatchStmt s):
     let subject = eval_expr(interp, s.subject)
     let result = eval_match(interp, subject, s.arms)
+    # A `return`/`throw` inside an arm block surfaces as a pending return/throw.
+    if interp.has_pending_throw:
+        return ThrowSignal(interp.take_pending_throw())
+    if interp.has_pending_return:
+        let rv = interp.pending_return_val
+        interp.has_pending_return = false
+        interp.pending_return_val = Value.Nil
+        return ReturnSignal(rv)
     ReturnSignal(result)
 
 def Signal? exec_block_fn(mut Interpreter interp, [Stmt] stmts):
