@@ -155,6 +155,7 @@ struct FieldDecl:
     bool is_transient
     Type ty
     Expr? default
+    [Attr] attrs
     int line
 
 struct InitDecl:

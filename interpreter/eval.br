@@ -205,6 +205,18 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         # Function/constructor call
         ExprKind.Call(callee_expr, args):
+            # `json(v)`: the built-in serializer, unless the program defines its own `json`.
+            match callee_expr.kind:
+                ExprKind.Var(builtin_name):
+                    if builtin_name == "json" and args.length == 1:
+                        var user_json = false
+                        if let _ = interp.get_fn_decl("json"):
+                            user_json = true
+                        if not user_json:
+                            let json_arg_vals = eval_args_with_hints(interp, args, [])
+                            let json_subject = json_arg_vals[0] else Value.Nil
+                            return Value.Str(json_serialize(interp, json_subject))
+                _: nil
             let callee = eval_expr(interp, callee_expr)
             let hints = call_hint_types(interp, callee, args.length)
             let arg_vals = eval_args_with_hints(interp, args, hints)
@@ -225,6 +237,25 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     eval_expr(interp, Expr(kind= ExprKind.MethodCall(receiver, method, gen_args), line= expr.line))
                 ExprKind.OptionalField(receiver, method):
                     eval_expr(interp, Expr(kind= ExprKind.OptionalMethodCall(receiver, method, gen_args), line= expr.line))
+                ExprKind.Var(gen_name):
+                    # `fromJson<T>(text)`: the built-in type-directed deserializer.
+                    if gen_name == "fromJson" and _type_args.length == 1 and gen_args.length == 1:
+                        var user_from_json = false
+                        if let _ = interp.get_fn_decl("fromJson"):
+                            user_from_json = true
+                        if not user_from_json:
+                            let from_json_vals = eval_args_with_hints(interp, gen_args, [])
+                            let from_json_src = from_json_vals[0] else Value.Nil
+                            match from_json_src:
+                                Value.Str(text): return json_from_text(interp, text, _type_args[0])
+                                _: return Value.Nil
+                    let gen_callee = eval_expr(interp, callee_expr2)
+                    let gen_hints = call_hint_types(interp, gen_callee, gen_args.length)
+                    let gen_arg_vals = eval_args_with_hints(interp, gen_args, gen_hints)
+                    interp.last_var_params = []
+                    let gen_result = call_value(interp, gen_callee, gen_arg_vals)
+                    write_back_fn_var_args(interp, gen_callee, gen_args)
+                    gen_result
                 _:
                     let gen_callee = eval_expr(interp, callee_expr2)
                     let gen_hints = call_hint_types(interp, gen_callee, gen_args.length)
@@ -3142,6 +3173,24 @@ req string debug_value(Interpreter interp, Value val):
                 result = result + debug_value(interp, items[i])
                 i = i + 1
             result + "]"
+        Value.Tuple(items):
+            var result = "("
+            var i = 0
+            while i < items.length:
+                if i > 0:
+                    result = result + ", "
+                result = result + debug_value(interp, items[i])
+                i = i + 1
+            result + ")"
+        Value.Dict(entries):
+            var result = "{{"
+            var i = 0
+            while i < entries.length:
+                if i > 0:
+                    result = result + ", "
+                result = result + debug_value(interp, entries[i].0) + ": " + debug_value(interp, entries[i].1)
+                i = i + 1
+            result + "}}"
         _: display_value(interp, val)
 
 req string display_value(Interpreter interp, Value val):
@@ -3226,12 +3275,13 @@ req string display_value(Interpreter interp, Value val):
             elif fields.length == 0:
                 variant
             else:
+                # An enum prints like its derived `Debug`: payload strings quoted, floats with `.0`.
                 var result = "{variant}("
                 var i = 0
                 while i < fields.length:
                     if i > 0:
                         result = result + ", "
-                    result = result + display_value(interp, fields[i])
+                    result = result + debug_value(interp, fields[i])
                     i = i + 1
                 result + ")"
         _:
@@ -3782,6 +3832,13 @@ def Value instantiate_struct(mut Interpreter interp, StructDecl decl, [Value] ar
                 fval = eval_expr(interp, default_expr)
             elif default_rest:
                 fval = default_value_for_type(field.ty)
+            elif attrs_have(field.attrs, "inject"):
+                # `@inject`: the omitted argument is the result of the `@provide` function
+                # returning this field's type.
+                let provider_name = interp.providers.get(type_decl_name(field.ty))
+                if let pname = provider_name:
+                    if let pdecl = interp.get_fn_decl(pname):
+                        fval = call_fn(interp, pdecl, [], nil)
             fields.push((field.name, coerce_declared_value(interp, fval, field.ty)))
     # Handle init declarations: pub params become fields
     if decl.inits.length > 0:

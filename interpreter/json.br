@@ -1,0 +1,765 @@
+# Copyright (C) 2026 Mickaël LANOË
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# == JSON: `json(v)` and `fromJson<T>(s)` ==
+#
+# Port of the Rust interpreter's src/interpreter/json.rs. `fromJson<T>` is type-directed:
+# the text is parsed into a generic tree (`JVal`), then walked against the *Boring* target
+# type, honouring `@serde(rename = "..")`, `@serde(rename_all = "..")`, `@serde(untagged)`
+# and `@serde(tag = "..", content = "..")`. A syntax error or a shape mismatch gives nil,
+# like the transpiler's `serde_json::from_str(..).ok()`. `json(v)` walks a runtime `Value`
+# the opposite way and prints compact JSON (struct fields in declaration order).
+
+# ─── Generic JSON tree ────────────────────────────────────────────────────────
+
+enum JVal:
+    JNull
+    JBool(bool b)
+    JInt(int n)
+    JFloat(float64 f)
+    JStr(string s)
+    JArr([JVal] items)
+    JObj([(string, JVal)] entries)
+
+struct JsonParser:
+    [string] chars
+    var int pos = 0
+
+    req bool at_end():
+        self.pos >= self.chars.length
+
+    req string peek_char():
+        if self.pos < self.chars.length:
+            self.chars[self.pos]
+        else:
+            ""
+
+    def void skip_ws():
+        while self.pos < self.chars.length:
+            let c = self.chars[self.pos]
+            if c == " " or c == "\n" or c == "\t" or c == "\r":
+                self.pos = self.pos + 1
+            else:
+                break
+
+    def string next_char() throws:
+        if self.pos >= self.chars.length:
+            throw "unexpected end of JSON"
+        let c = self.chars[self.pos]
+        self.pos = self.pos + 1
+        c
+
+def int json_hex_digit(string c) throws:
+    if c >= "0" and c <= "9":
+        return ord(c) - ord("0")
+    if c >= "a" and c <= "f":
+        return ord(c) - ord("a") + 10
+    if c >= "A" and c <= "F":
+        return ord(c) - ord("A") + 10
+    throw "bad hex digit"
+
+def int json_parse_hex4(mut JsonParser jp) throws:
+    var n = 0
+    var i = 0
+    while i < 4:
+        n = n * 16 + json_hex_digit(jp.next_char())
+        i = i + 1
+    n
+
+def string json_parse_string(mut JsonParser jp) throws:
+    # the opening quote is already consumed
+    var out = ""
+    while true:
+        let c = jp.next_char()
+        if c == "\"":
+            break
+        if c == "\\":
+            let e = jp.next_char()
+            if e == "n":
+                out = out + "\n"
+            elif e == "t":
+                out = out + "\t"
+            elif e == "r":
+                out = out + "\r"
+            elif e == "b":
+                out = out + chr(8)
+            elif e == "f":
+                out = out + chr(12)
+            elif e == "/":
+                out = out + "/"
+            elif e == "\\":
+                out = out + "\\"
+            elif e == "\"":
+                out = out + "\""
+            elif e == "u":
+                var code = json_parse_hex4(jp)
+                # a high surrogate must be followed by `\uXXXX` (low surrogate)
+                if code >= 55296 and code <= 56319:
+                    if jp.next_char() != "\\" or jp.next_char() != "u":
+                        throw "bad surrogate pair"
+                    let low = json_parse_hex4(jp)
+                    if low < 56320 or low > 57343:
+                        throw "bad surrogate pair"
+                    code = 65536 + (code - 55296) * 1024 + (low - 56320)
+                out = out + chr(code)
+            else:
+                throw "bad escape"
+        else:
+            out = out + c
+    out
+
+def JVal json_parse_number(mut JsonParser jp) throws:
+    var text = ""
+    var is_float = false
+    while not jp.at_end():
+        let c = jp.peek_char()
+        if (c >= "0" and c <= "9") or c == "-" or c == "+":
+            text = text + c
+            jp.pos = jp.pos + 1
+        elif c == "." or c == "e" or c == "E":
+            is_float = true
+            text = text + c
+            jp.pos = jp.pos + 1
+        else:
+            break
+    if text == "" or text == "-":
+        throw "bad number"
+    if not is_float:
+        if let n = text.parse_int():
+            return JVal.JInt(n)
+    if let f = text.parse_float():
+        return JVal.JFloat(f)
+    throw "bad number"
+
+def JVal json_parse_value(mut JsonParser jp) throws:
+    jp.skip_ws()
+    let c = jp.peek_char()
+    if c == "{{":
+        jp.pos = jp.pos + 1
+        mut [(string, JVal)] entries = []
+        jp.skip_ws()
+        if jp.peek_char() == "}}":
+            jp.pos = jp.pos + 1
+            return JVal.JObj(entries)
+        while true:
+            jp.skip_ws()
+            if jp.next_char() != "\"":
+                throw "object key must be a string"
+            let key = json_parse_string(jp)
+            jp.skip_ws()
+            if jp.next_char() != ":":
+                throw "expected ':'"
+            let val = json_parse_value(jp)
+            # a repeated key keeps the last value, like serde_json's map
+            var replaced = false
+            var ei = 0
+            while ei < entries.length:
+                if entries[ei].0 == key:
+                    entries[ei] = (key, val)
+                    replaced = true
+                ei = ei + 1
+            if not replaced:
+                entries.push((key, val))
+            jp.skip_ws()
+            let sep = jp.next_char()
+            if sep == "}}":
+                break
+            if sep != ",":
+                throw "expected ',' or '}'"
+        return JVal.JObj(entries)
+    if c == "[":
+        jp.pos = jp.pos + 1
+        mut [JVal] items = []
+        jp.skip_ws()
+        if jp.peek_char() == "]":
+            jp.pos = jp.pos + 1
+            return JVal.JArr(items)
+        while true:
+            items.push(json_parse_value(jp))
+            jp.skip_ws()
+            let sep = jp.next_char()
+            if sep == "]":
+                break
+            if sep != ",":
+                throw "expected ',' or ']'"
+        return JVal.JArr(items)
+    if c == "\"":
+        jp.pos = jp.pos + 1
+        return JVal.JStr(json_parse_string(jp))
+    if c == "t":
+        json_expect_word(jp, "true")
+        return JVal.JBool(true)
+    if c == "f":
+        json_expect_word(jp, "false")
+        return JVal.JBool(false)
+    if c == "n":
+        json_expect_word(jp, "null")
+        return JVal.JNull
+    json_parse_number(jp)
+
+def void json_expect_word(mut JsonParser jp, string word) throws:
+    for wc in word.chars():
+        if jp.next_char() != wc:
+            throw "bad literal"
+
+def JVal json_parse_text(string src) throws:
+    mut jp = JsonParser(chars= src.chars(), pos= 0)
+    let v = json_parse_value(jp)
+    jp.skip_ws()
+    if not jp.at_end():
+        throw "trailing characters"
+    v
+
+# ─── `@serde(...)` attribute helpers ──────────────────────────────────────────
+
+# The value of `key = "..."` inside any `@serde(...)` attribute, or nil. Arguments arrive as
+# the concatenated tokens (`rename="x"`).
+def int json_index_of_eq(string text):
+    var i = 0
+    for c in text.chars():
+        if c == "=":
+            return i
+        i = i + 1
+    -1
+
+def string? serde_str_arg([Attr] attrs, string key):
+    for a in attrs:
+        if a.name == "serde":
+            for arg in a.args:
+                let string argt = arg
+                let eq = json_index_of_eq(argt)
+                if eq >= 0:
+                    let string k = argt.slice(0, eq).trim()
+                    if k == key:
+                        let string raw = argt.slice(eq + 1, argt.length).trim()
+                        if raw.length >= 2 and raw.slice(0, 1) == "\"":
+                            return raw.slice(1, raw.length - 1)
+                        return raw
+    nil
+
+def bool serde_has_flag([Attr] attrs, string flag):
+    for a in attrs:
+        if a.name == "serde":
+            for arg in a.args:
+                let string argt = arg
+                let string trimmed = argt.trim()
+                if trimmed == flag:
+                    return true
+    false
+
+def bool json_is_upper(string ch):
+    ord(ch) >= 65 and ord(ch) <= 90
+
+def string json_lower_char(string ch):
+    if json_is_upper(ch):
+        return chr(ord(ch) + 32)
+    ch
+
+def [string] json_split_words(string name):
+    mut [string] words = []
+    var cur = ""
+    for ch in name.chars():
+        if ch == "_" or ch == "-":
+            if cur != "":
+                words.push(cur)
+                cur = ""
+        elif json_is_upper(ch) and cur != "":
+            words.push(cur)
+            cur = json_lower_char(ch)
+        else:
+            cur = cur + json_lower_char(ch)
+    if cur != "":
+        words.push(cur)
+    words
+
+def string json_capitalize(string w):
+    if w.length == 0:
+        return w
+    let string head = w.slice(0, 1).toUpper()
+    let string tail = w.slice(1, w.length)
+    "{head}{tail}"
+
+def string json_join([string] words, string sep):
+    var out = ""
+    var i = 0
+    while i < words.length:
+        if i > 0:
+            out = out + sep
+        out = out + words[i]
+        i = i + 1
+    out
+
+def string json_apply_rename_rule(string name, string rule):
+    let words = json_split_words(name)
+    if rule == "lowercase":
+        return json_join(words, "")
+    if rule == "UPPERCASE":
+        return json_join(words, "").toUpper()
+    if rule == "PascalCase" or rule == "camelCase":
+        var out = ""
+        var i = 0
+        while i < words.length:
+            if i == 0 and rule == "camelCase":
+                out = out + words[i]
+            else:
+                out = out + json_capitalize(words[i])
+            i = i + 1
+        return out
+    if rule == "snake_case":
+        return json_join(words, "_")
+    if rule == "SCREAMING_SNAKE_CASE":
+        return json_join(words, "_").toUpper()
+    if rule == "kebab-case":
+        return json_join(words, "-")
+    if rule == "SCREAMING-KEBAB-CASE":
+        return json_join(words, "-").toUpper()
+    name
+
+# The JSON key a field/variant is (de)serialized under: its own `rename` wins, then the
+# container's `rename_all`, else the Boring spelling.
+def string json_key(string name, [Attr] own_attrs, [Attr] container_attrs):
+    if let r = serde_str_arg(own_attrs, "rename"):
+        return r
+    if let rule = serde_str_arg(container_attrs, "rename_all"):
+        return json_apply_rename_rule(name, rule)
+    name
+
+# ─── Serialization: `json(v)` ─────────────────────────────────────────────────
+
+def string json_escape_string(string s):
+    var out = "\""
+    for c in s.chars():
+        let code = ord(c)
+        if c == "\"":
+            out = out + "\\\""
+        elif c == "\\":
+            out = out + "\\\\"
+        elif c == "\n":
+            out = out + "\\n"
+        elif c == "\r":
+            out = out + "\\r"
+        elif c == "\t":
+            out = out + "\\t"
+        elif code == 8:
+            out = out + "\\b"
+        elif code == 12:
+            out = out + "\\f"
+        elif code < 32:
+            let hex = "0123456789abcdef"
+            out = out + "\\u00" + hex.slice(code / 16, code / 16 + 1) + hex.slice(code % 16, code % 16 + 1)
+        else:
+            out = out + c
+    out + "\""
+
+def string json_float_text(float64 f):
+    # NaN and infinities have no JSON form
+    if f != f or f > 1.7976931348623157e308 or f < -1.7976931348623157e308:
+        return "null"
+    float_debug_str(f)
+
+def string json_object_text([(string, string)] members):
+    var out = "{{"
+    var i = 0
+    while i < members.length:
+        if i > 0:
+            out = out + ","
+        out = out + json_escape_string(members[i].0) + ":" + members[i].1
+        i = i + 1
+    out + "}}"
+
+def string json_array_text([string] items):
+    "[" + json_join(items, ",") + "]"
+
+def string json_serialize(mut Interpreter interp, Value v):
+    match v:
+        Value.Bool(b): if b: "true" else: "false"
+        Value.Int(n): "{n}"
+        Value.Int8(n): "{n}"
+        Value.Int16(n): "{n}"
+        Value.Int32(n): "{n}"
+        Value.Int64(n): "{n}"
+        Value.Int128(n): "{n}"
+        Value.Uint(n): "{n}"
+        Value.Uint8(n): "{n}"
+        Value.Uint16(n): "{n}"
+        Value.Uint32(n): "{n}"
+        Value.Uint64(n): "{n}"
+        Value.Uint128(n): "{n}"
+        Value.Float64(f): json_float_text(f)
+        Value.Float32(f): json_float_text(f as float64)
+        Value.Float16(f): json_float_text((f as float32) as float64)
+        Value.Str(s): json_escape_string(s)
+        Value.Array(items): json_serialize_list(interp, items)
+        Value.Tuple(items): json_serialize_list(interp, items)
+        Value.Set(items): json_serialize_list(interp, items)
+        Value.Dict(pairs):
+            mut [(string, string)] members = []
+            for pair in pairs:
+                let key = match pair.0:
+                    Value.Str(ks): ks
+                    _: display_value(interp, pair.0)
+                members.push((key, json_serialize(interp, pair.1)))
+            json_object_text(members)
+        Value.Object(inner):
+            let decl_opt = interp.get_struct_decl(inner.type_name)
+            mut [(string, string)] members = []
+            if let decl = decl_opt:
+                for f in decl.fields:
+                    if let fv = inner.get_field(f.name):
+                        members.push((json_key(f.name, f.attrs, decl.attrs), json_serialize(interp, fv)))
+            else:
+                for f in inner.fields:
+                    if not f.0.starts_with("__"):
+                        members.push((f.0, json_serialize(interp, f.1)))
+            json_object_text(members)
+        Value.EnumVariant(type_name, variant, fields):
+            let decl_opt = interp.get_enum_decl(type_name)
+            if let decl = decl_opt:
+                json_serialize_variant(interp, decl, variant, fields)
+            else:
+                "null"
+        _: "null"
+
+def string json_serialize_list(mut Interpreter interp, [Value] items):
+    mut [string] parts = []
+    for item in items:
+        parts.push(json_serialize(interp, item))
+    json_array_text(parts)
+
+# One enum variant per serde's rules: untagged writes just the payload; `tag` (+ `content`)
+# writes the internally/adjacently tagged object; otherwise the externally tagged default.
+def string json_serialize_variant(mut Interpreter interp, EnumDecl decl, string variant_name, [Value] fields):
+    var [Attr] variant_attrs = []
+    for vd in decl.variants:
+        if vd.name == variant_name:
+            variant_attrs = vd.attrs
+    let tag = json_key(variant_name, variant_attrs, decl.attrs)
+    var string? payload = nil
+    if fields.length == 1:
+        payload = json_serialize(interp, fields[0])
+    elif fields.length > 1:
+        payload = json_serialize_list(interp, fields)
+    if serde_has_flag(decl.attrs, "untagged"):
+        if let pl = payload:
+            return pl
+        return "null"
+    if let tag_key = serde_str_arg(decl.attrs, "tag"):
+        mut [(string, string)] members = [(tag_key, json_escape_string(tag))]
+        if let content_key = serde_str_arg(decl.attrs, "content"):
+            if let pl = payload:
+                members.push((content_key, pl))
+        else:
+            # internally tagged: the payload object's keys sit next to the tag
+            if let pl = payload:
+                if pl.starts_with("{{") and fields.length == 1:
+                    let flat = json_flatten_object(interp, fields[0])
+                    for m in flat:
+                        members.push(m)
+        return json_object_text(members)
+    if fields.length == 0:
+        return json_escape_string(tag)
+    if let pl2 = payload:
+        return json_object_text([(tag, pl2)])
+    json_object_text([(tag, "null")])
+
+# The members of a struct/dict value as `(key, json)` pairs.
+def [(string, string)] json_flatten_object(mut Interpreter interp, Value v):
+    mut [(string, string)] members = []
+    match v:
+        Value.Dict(pairs):
+            for pair in pairs:
+                let key = match pair.0:
+                    Value.Str(ks): ks
+                    _: display_value(interp, pair.0)
+                members.push((key, json_serialize(interp, pair.1)))
+        Value.Object(inner):
+            let decl_opt = interp.get_struct_decl(inner.type_name)
+            if let decl = decl_opt:
+                for f in decl.fields:
+                    if let fv = inner.get_field(f.name):
+                        members.push((json_key(f.name, f.attrs, decl.attrs), json_serialize(interp, fv)))
+        _: nil
+    members
+
+# ─── Type-directed materialization: `fromJson<T>(s)` ──────────────────────────
+
+def Type json_resolve_type(Type ty):
+    match ty:
+        Type.Qualified(inner, _): json_resolve_type(inner)
+        Type.TypeParam(name): Type.Named(name)
+        _: ty
+
+def JVal? json_obj_get([(string, JVal)] entries, string key):
+    for e in entries:
+        if e.0 == key:
+            return e.1
+    nil
+
+def Value json_int_in_range(int n, int lo, int hi) throws:
+    if n < lo or n > hi:
+        throw "number out of range"
+    Value.Int(n)
+
+def float64 json_as_float(JVal j) throws:
+    match j:
+        JVal.JInt(n): n as float64
+        JVal.JFloat(f): f
+        _: throw "expected a number"
+
+def Value json_to_value(mut Interpreter interp, JVal j, Type ty0) throws:
+    let ty = json_resolve_type(ty0)
+    match ty:
+        Type.Optional(inner):
+            match j:
+                JVal.JNull: Value.Nil
+                _: json_to_value(interp, j, inner)
+        Type.Bool:
+            match j:
+                JVal.JBool(b): Value.Bool(b)
+                _: throw "expected a bool"
+        Type.Int:
+            match j:
+                JVal.JInt(n): Value.Int(n)
+                _: throw "expected an int"
+        Type.Int64:
+            match j:
+                JVal.JInt(n): Value.Int64(n as int64)
+                _: throw "expected an int"
+        Type.Int128:
+            match j:
+                JVal.JInt(n): Value.Int128(n as int128)
+                _: throw "expected an int"
+        Type.Int8:
+            match j:
+                JVal.JInt(n):
+                    if n < -128 or n > 127:
+                        throw "number out of range"
+                    Value.Int8(n as int8)
+                _: throw "expected an int"
+        Type.Int16:
+            match j:
+                JVal.JInt(n):
+                    if n < -32768 or n > 32767:
+                        throw "number out of range"
+                    Value.Int16(n as int16)
+                _: throw "expected an int"
+        Type.Int32:
+            match j:
+                JVal.JInt(n):
+                    if n < -2147483648 or n > 2147483647:
+                        throw "number out of range"
+                    Value.Int32(n as int32)
+                _: throw "expected an int"
+        Type.Uint:
+            match j:
+                JVal.JInt(n):
+                    if n < 0:
+                        throw "expected an unsigned int"
+                    Value.Uint(n as uint)
+                _: throw "expected an unsigned int"
+        Type.Uint64:
+            match j:
+                JVal.JInt(n):
+                    if n < 0:
+                        throw "expected an unsigned int"
+                    Value.Uint64(n as uint64)
+                _: throw "expected an unsigned int"
+        Type.Uint128:
+            match j:
+                JVal.JInt(n):
+                    if n < 0:
+                        throw "expected an unsigned int"
+                    Value.Uint128(n as uint128)
+                _: throw "expected an unsigned int"
+        Type.Uint8:
+            match j:
+                JVal.JInt(n):
+                    if n < 0 or n > 255:
+                        throw "number out of range"
+                    Value.Uint8(n as uint8)
+                _: throw "expected an unsigned int"
+        Type.Uint16:
+            match j:
+                JVal.JInt(n):
+                    if n < 0 or n > 65535:
+                        throw "number out of range"
+                    Value.Uint16(n as uint16)
+                _: throw "expected an unsigned int"
+        Type.Uint32:
+            match j:
+                JVal.JInt(n):
+                    if n < 0 or n > 4294967295:
+                        throw "number out of range"
+                    Value.Uint32(n as uint32)
+                _: throw "expected an unsigned int"
+        Type.Float64:
+            Value.Float64(json_as_float(j))
+        Type.Float32:
+            Value.Float32(json_as_float(j) as float32)
+        Type.Float16:
+            Value.Float16(json_as_float(j) as float16)
+        Type.Str:
+            match j:
+                JVal.JStr(s): Value.Str(s)
+                _: throw "expected a string"
+        Type.Array(elem):
+            match j:
+                JVal.JArr(items):
+                    mut [Value] out = []
+                    for item in items:
+                        out.push(json_to_value(interp, item, elem))
+                    Value.Array(out)
+                _: throw "expected an array"
+        Type.ArrayN(elem, n):
+            match j:
+                JVal.JArr(items):
+                    if items.length != n:
+                        throw "wrong array length"
+                    mut [Value] out = []
+                    for item in items:
+                        out.push(json_to_value(interp, item, elem))
+                    Value.Array(out)
+                _: throw "expected an array"
+        Type.Set(elem):
+            match j:
+                JVal.JArr(items):
+                    mut [Value] out = []
+                    for item in items:
+                        let sv = json_to_value(interp, item, elem)
+                        if not value_list_contains(out, sv):
+                            out.push(sv)
+                    Value.Set(out)
+                _: throw "expected an array"
+        Type.Tuple(elems):
+            match j:
+                JVal.JArr(items):
+                    if items.length != elems.length:
+                        throw "wrong tuple length"
+                    mut [Value] out = []
+                    var ti = 0
+                    while ti < items.length:
+                        out.push(json_to_value(interp, items[ti], elems[ti]))
+                        ti = ti + 1
+                    Value.Tuple(out)
+                _: throw "expected an array"
+        Type.Dict(kty, vty):
+            match json_resolve_type(kty):
+                Type.Str: nil
+                _: throw "dict keys must be strings"
+            match j:
+                JVal.JObj(entries):
+                    mut [(Value, Value)] pairs = []
+                    for e in entries:
+                        pairs.push((Value.Str(e.0), json_to_value(interp, e.1, vty)))
+                    Value.Dict(pairs)
+                _: throw "expected an object"
+        Type.Named(name):
+            if let edecl = interp.get_enum_decl(name):
+                return json_to_enum(interp, j, edecl)
+            if let sdecl = interp.get_struct_decl(name):
+                return json_to_struct(interp, j, sdecl)
+            throw "unknown type {name}"
+        _: throw "unsupported type"
+
+def Value json_to_struct(mut Interpreter interp, JVal j, StructDecl decl) throws:
+    match j:
+        JVal.JObj(entries):
+            mut [Value] args = []
+            for f in decl.fields:
+                let key = json_key(f.name, f.attrs, decl.attrs)
+                var Value? fval = nil
+                if let jv = json_obj_get(entries, key):
+                    fval = json_to_value(interp, jv, f.ty)
+                elif let default_expr = f.default:
+                    fval = eval_expr(interp, default_expr)
+                else:
+                    match json_resolve_type(f.ty):
+                        Type.Optional(_): fval = Value.Nil
+                        _: throw "missing field {key}"
+                if let fv = fval:
+                    args.push(Value.Labeled(f.name, fv))
+            instantiate_struct(interp, decl, args)
+        _: throw "expected an object"
+
+# The payload fields of one variant out of `j`: 0 fields match null, 1 field is the value
+# itself, N fields a positional array.
+def [Value] json_variant_payload(mut Interpreter interp, JVal j, [VariantField] fields) throws:
+    mut [Value] out = []
+    if fields.length == 0:
+        match j:
+            JVal.JNull: nil
+            _: throw "expected null"
+        return out
+    if fields.length == 1:
+        out.push(json_to_value(interp, j, fields[0].ty))
+        return out
+    match j:
+        JVal.JArr(items):
+            if items.length != fields.length:
+                throw "wrong payload length"
+            var i = 0
+            while i < fields.length:
+                out.push(json_to_value(interp, items[i], fields[i].ty))
+                i = i + 1
+            out
+        _: throw "expected an array"
+
+def EnumVariant json_find_variant(EnumDecl decl, string tag) throws:
+    for vd in decl.variants:
+        if json_key(vd.name, vd.attrs, decl.attrs) == tag:
+            return vd
+    throw "unknown variant {tag}"
+
+def Value json_to_enum(mut Interpreter interp, JVal j, EnumDecl decl) throws:
+    if serde_has_flag(decl.attrs, "untagged"):
+        for vd in decl.variants:
+            let attempt = try? json_variant_payload(interp, j, vd.fields)
+            if let fields = attempt:
+                return Value.EnumVariant(decl.name, vd.name, fields)
+        throw "no variant matches"
+    if let tag_key = serde_str_arg(decl.attrs, "tag"):
+        match j:
+            JVal.JObj(entries):
+                let tag_val = json_obj_get(entries, tag_key) else JVal.JNull
+                var tag = ""
+                match tag_val:
+                    JVal.JStr(ts): tag = ts
+                    _: throw "missing tag"
+                let vd = json_find_variant(decl, tag)
+                if let content_key = serde_str_arg(decl.attrs, "content"):
+                    let content = json_obj_get(entries, content_key) else JVal.JNull
+                    return Value.EnumVariant(decl.name, vd.name, json_variant_payload(interp, content, vd.fields))
+                # internally tagged: the payload is the object minus the tag key
+                if vd.fields.length == 0:
+                    return Value.EnumVariant(decl.name, vd.name, [])
+                if vd.fields.length == 1:
+                    mut [(string, JVal)] rest = []
+                    for e in entries:
+                        if e.0 != tag_key:
+                            rest.push(e)
+                    return Value.EnumVariant(decl.name, vd.name, [json_to_value(interp, JVal.JObj(rest), vd.fields[0].ty)])
+                throw "unsupported internally tagged variant"
+            _: throw "expected an object"
+    # externally tagged (serde's default)
+    match j:
+        JVal.JStr(tag):
+            for vd in decl.variants:
+                if vd.fields.length == 0 and json_key(vd.name, vd.attrs, decl.attrs) == tag:
+                    return Value.EnumVariant(decl.name, vd.name, [])
+            throw "unknown variant {tag}"
+        JVal.JObj(entries):
+            if entries.length != 1:
+                throw "expected a single-key object"
+            let vd = json_find_variant(decl, entries[0].0)
+            Value.EnumVariant(decl.name, vd.name, json_variant_payload(interp, entries[0].1, vd.fields))
+        _: throw "expected a string or an object"
+
+# `fromJson<T>(src)`: the value, or nil on a syntax error / shape mismatch.
+def Value json_from_text(mut Interpreter interp, string src, Type ty):
+    let parsed = try? json_parse_text(src)
+    guard let tree = parsed else: return Value.Nil
+    let built = try? json_to_value(interp, tree, ty)
+    if let v = built:
+        v
+    else:
+        Value.Nil

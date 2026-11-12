@@ -541,6 +541,14 @@ def bool exec_if_let_match(mut Interpreter interp, [CondClause] clauses):
                 let v = eval_cond_in_env(interp, child, expr)
                 if not match_pattern(v, pat, child, interp):
                     all_matched = false
+                else:
+                    # `if let _ = opt:` is a presence test: an absent optional (nil) does not match.
+                    match pat:
+                        Pattern.Wildcard:
+                            match v:
+                                Value.Nil: all_matched = false
+                                _: nil
+                        _: nil
             CondClause.Expr(expr):
                 # guard: eval in child context via helper (forces Arc::clone at call site)
                 let gv = eval_in_env(interp, child, expr)
@@ -1067,6 +1075,13 @@ def [Value] exec_stream_fn(mut Interpreter interp, [Stmt] stmts):
         _: nil
     result
 
+# Does an attribute list carry `@name`?
+def bool attrs_have([Attr] attrs, string name):
+    for a in attrs:
+        if a.name == name:
+            return true
+    false
+
 # ─── call_fn ──────────────────────────────────────────────────────────────────
 
 # Record the final value of each `mut`/`var` parameter (read from the callee's scope `env`)
@@ -1085,7 +1100,7 @@ def void capture_var_param_outs(mut Interpreter interp, [Param] params, Env'acto
 
 def Value call_fn(mut Interpreter interp, FnDecl decl, [Value] args, Env'actor? captured):
     # `@singleton`: the body runs at most once; every later call returns the cached value.
-    if decl.attrs.length > 0 and decl.attrs[0].name == "singleton":
+    if attrs_have(decl.attrs, "singleton"):
         let cached = interp.singletons.get(decl.name)
         if let hit = cached:
             return hit

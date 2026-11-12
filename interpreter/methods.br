@@ -515,6 +515,33 @@ def Value field_value_wrapped(Value v):
 def Value introspect_field(string name, int index):
     Value.Object(ObjectInner(type_name= "Field", fields= [("name", Value.Str(name)), ("index", Value.Int(index))]))
 
+def Value introspect_method_obj(string name, bool is_pub, bool is_instance, bool is_mutable, bool is_task, bool is_stream, bool is_throwing, string owner, string kind):
+    var variant = "Plain"
+    if is_task:
+        variant = "Task"
+    elif is_stream:
+        variant = "Stream"
+    Value.Object(ObjectInner(type_name= "Method", fields= [("name", Value.Str(name)), ("isPublic", Value.Bool(is_pub)), ("isInstance", Value.Bool(is_instance)), ("isMutable", Value.Bool(is_mutable)), ("isCallable", Value.Bool(not is_task and not is_stream)), ("isThrowing", Value.Bool(is_throwing)), ("kind", Value.EnumVariant("MethodKind", variant, [])), ("__ownerType", Value.Str(owner)), ("__kind", Value.Str(kind))]))
+
+# Instance methods first (declaration order), then the type-level `type def`/`type req` ones.
+def [Value] introspect_methods(string owner, [FnDecl] methods, [TypeMethod] type_methods):
+    mut [Value] out = []
+    for m in methods:
+        if not m.is_native:
+            out.push(introspect_method_obj(m.name, m.is_pub, true, m.mutating, m.is_task, m.is_stream, m.can_throw, owner, "instance"))
+    for tm in type_methods:
+        var is_set = false
+        match tm.kind:
+            TypeMethodKind.Set: is_set = true
+            _: nil
+        if not is_set:
+            var is_def = false
+            match tm.kind:
+                TypeMethodKind.Def: is_def = true
+                _: nil
+            out.push(introspect_method_obj(tm.name, tm.is_pub, false, is_def, tm.is_task, false, tm.can_throw, owner, "type"))
+    out
+
 Value? introspect_method(mut Interpreter interp, Value recv, string method_name, [Value] args):
     match recv:
         Value.Object(inner):
@@ -540,7 +567,7 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                 for f in sd.fields:
                     flds.push(introspect_field(f.name, i))
                     i += 1
-                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(sd.name)), ("fields", Value.Array(flds))]))
+                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(sd.name)), ("fields", Value.Array(flds)), ("methods", Value.Array(introspect_methods(sd.name, sd.methods, sd.type_methods)))]))
             nil
         Value.EnumVariant(tname, vname, _):
             if method_name == "introspect" and args.length == 0:
@@ -555,7 +582,7 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                                 fname = vfn
                             flds.push(introspect_field(fname, j))
                             j += 1
-                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(ed.name)), ("variantName", Value.Str(vname)), ("fields", Value.Array(flds))]))
+                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(ed.name)), ("variantName", Value.Str(vname)), ("fields", Value.Array(flds)), ("methods", Value.Array(introspect_methods(ed.name, ed.methods, ed.type_methods)))]))
             nil
         _: nil
 

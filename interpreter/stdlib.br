@@ -25,6 +25,8 @@ struct Interpreter:
     var [string] cli_args = []
     # `@singleton` fn results, keyed by fn name (see `call_fn`).
     var {string=Value} singletons = {}
+    # `@provide` functions: provided type name -> function name (dependency injection, `@inject`).
+    var {string=string} providers = {}
     # `use a.b.c` resolution state — a reduced-scope port of the real
     # compiler's `search_paths`/`loaded` (src/interpreter/mod.rs). See
     # `exec_use` below for exactly what's supported.
@@ -743,6 +745,7 @@ def Interpreter'actor new_interpreter():
         in_kernel_context = false,
         cli_args = [],
         singletons = {},
+        providers = {},
         return_ty_stack = [],
         last_var_params = [],
         search_paths = [],
@@ -776,8 +779,22 @@ def Interpreter'actor new_interpreter():
 # with an actual declared function. `fn_decls[name]` itself is left pointing at the
 # first-declared variant for callers that look functions up by bare name outside the
 # OverloadedFn path (e.g. the `|>` pipe operator's `interp.get_fn_decl(method)`).
+# Base type name of a (possibly qualified/optional/generic) type: `UserSession'actor` -> `UserSession`.
+def string type_decl_name(Type ty):
+    match ty:
+        Type.Named(n): n
+        Type.Qualified(inner, _): type_decl_name(inner)
+        Type.Optional(inner): type_decl_name(inner)
+        Type.Generic(n, _): n
+        _: ""
+
 def void register_free_fn(mut Interpreter interp, mut Env'actor target_env, FnDecl decl):
     let fn_name = decl.name
+    if attrs_have(decl.attrs, "provide"):
+        if let provided_ty = decl.return_ty:
+            mut {string=string} tmp_providers = interp.providers
+            tmp_providers.set(type_decl_name(provided_ty), fn_name)
+            interp.providers = tmp_providers
     let existing_opt = target_env.get_local(fn_name)
     if let existing = existing_opt:
         match existing:

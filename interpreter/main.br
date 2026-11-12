@@ -12,6 +12,7 @@ use methods
 use exec
 use eval
 use stdlib
+use json
 
 # == MAIN ==
 #
