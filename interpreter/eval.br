@@ -217,12 +217,91 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                             let json_subject = json_arg_vals[0] else Value.Nil
                             return Value.Str(json_serialize(interp, json_subject))
                 _: nil
+            # A bare call naming a method of the running receiver (`mix(a, b)` inside a method).
+            match callee_expr.kind:
+                ExprKind.Var(bare_name):
+                    let bare_found = interp.current_env.get(bare_name)
+                    var bare_known = false
+                    if let _ = bare_found:
+                        bare_known = true
+                    if not bare_known:
+                        if let self_for_call = interp.current_env.get("self"):
+                            match self_for_call:
+                                Value.Object(self_obj):
+                                    let bare_vals = eval_args_with_hints(interp, args, [])
+                                    if let _ = interp.find_best_method(self_obj.type_name, bare_name, bare_vals):
+                                        return call_method(interp, self_for_call, bare_name, bare_vals)
+                                _: nil
+                _: nil
             let callee = eval_expr(interp, callee_expr)
             let hints = call_hint_types(interp, callee, args.length)
-            let arg_vals = eval_args_with_hints(interp, args, hints)
+            var mut arg_vals = eval_args_with_hints(interp, args, hints)
             # An argument that threw (`print early(1)`): propagate it, don't call with Nil.
             if interp.has_pending_throw:
                 return Value.Nil
+            # A bare struct variable handed to a constructor is stored as a copy.
+            match callee:
+                Value.StructDef(ctor_sname):
+                    var ctor_fields = []
+                    mut [string] ctor_binds = []
+                    if let ctor_decl = interp.get_struct_decl(ctor_sname):
+                        ctor_fields = ctor_decl.fields
+                        for ctor_attr in ctor_decl.attrs:
+                            if ctor_attr.name == "bind":
+                                for bn in ctor_attr.args:
+                                    ctor_binds.push(bn)
+                    var ci = 0
+                    while ci < args.length and ci < arg_vals.length:
+                        match arg_vals[ci]:
+                            Value.Labeled(lname, lval):
+                                # A `state` of the running view handed to a child's `bind` passes its `Slot`.
+                                var slot_passed = false
+                                if ctor_binds.contains(lname):
+                                    match args[ci].value.kind:
+                                        ExprKind.Var(bind_src):
+                                            if let st_env = interp.current_env.get("__st"):
+                                                match st_env:
+                                                    Value.Object(st_obj):
+                                                        if let st_field = st_obj.get_field(bind_src):
+                                                            match st_field:
+                                                                Value.Object(slot_obj):
+                                                                    if slot_obj.type_name == "Slot":
+                                                                        arg_vals[ci] = Value.Labeled(lname, st_field)
+                                                                        slot_passed = true
+                                                                _: nil
+                                                    _: nil
+                                        _: nil
+                                # ... and so does a `bind` field of the running view (the hop through its own slot).
+                                if ctor_binds.contains(lname) and not slot_passed:
+                                    match args[ci].value.kind:
+                                        ExprKind.Var(bind_src2):
+                                            if let self_env = interp.current_env.get("self"):
+                                                match self_env:
+                                                    Value.Object(self_obj):
+                                                        if let self_field = self_obj.get_field(bind_src2):
+                                                            match self_field:
+                                                                Value.Object(slot_obj2):
+                                                                    if slot_obj2.type_name == "Slot":
+                                                                        arg_vals[ci] = Value.Labeled(lname, self_field)
+                                                                        slot_passed = true
+                                                                _: nil
+                                                    _: nil
+                                        _: nil
+                                if slot_passed:
+                                    ci = ci + 1
+                                    continue
+                                var Type? lty = nil
+                                for cf in ctor_fields:
+                                    if cf.name == lname:
+                                        lty = cf.ty
+                                arg_vals[ci] = Value.Labeled(lname, byvalue_store(interp, args[ci].value, lval, lty))
+                            _:
+                                var Type? pty = nil
+                                if ci < ctor_fields.length:
+                                    pty = ctor_fields[ci].ty
+                                arg_vals[ci] = byvalue_store(interp, args[ci].value, arg_vals[ci], pty)
+                        ci = ci + 1
+                _: nil
             check_fixed_ctor_args(interp, callee, args, arg_vals)
             interp.last_var_params = []
             let result = call_value(interp, callee, arg_vals)
@@ -351,14 +430,26 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                 return Value.Array(removed)
                             _: nil
                     _: nil
+            # `h.clone()` on a `'actor`/`'shared` binding clones the handle: an alias.
+            if method == "clone" and args.length == 0:
+                match recv:
+                    Value.Object(_):
+                        match recv_expr.kind:
+                            ExprKind.Var(cl_name):
+                                let cl_alias = interp.current_env.get("__alias_{cl_name}")
+                                if let _ = cl_alias:
+                                    return recv
+                            _: nil
+                    _: nil
             check_mutating_method_call(interp, recv_expr, recv, method)
             let hints = method_hint_types(interp, recv, method, args.length)
             var mut arg_vals = eval_args_with_hints(interp, args, hints)
             # Storing a by-value struct parameter into a collection stores a copy.
             if method == "push" or method == "add" or method == "append" or method == "insert" or method == "set" or method == "put":
                 var ai = 0
+                let store_ty = store_dest_type(interp, recv_expr)
                 while ai < args.length and ai < arg_vals.length:
-                    arg_vals[ai] = byvalue_store(interp, args[ai].value, arg_vals[ai])
+                    arg_vals[ai] = byvalue_store(interp, args[ai].value, arg_vals[ai], store_ty)
                     ai = ai + 1
             interp.last_var_params = []
             let recv_is_self = is_self_var(recv_expr)
@@ -552,6 +643,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                 _:
                     let obj = eval_expr(interp, obj_expr)
                     let idx = eval_expr(interp, idx_expr)
+                    # A big read-only array of a running kernel, kept in chunks so that reading one
+                    # element copies one chunk, not the whole array.
+                    match obj:
+                        Value.Object(chunked):
+                            if chunked.type_name == "__ArrayRef":
+                                return chunked_array_get(chunked, idx)
+                        _: nil
                     get_index(interp, obj, idx)
 
         # Labeled multi-dim array indexing: a[width = w, height = h]
@@ -797,6 +895,20 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                 let values = collect_array_block(interp, body, interp.current_env)
                                 return instantiate_struct(interp, decl, [Value.Labeled(last_field.name, Value.Array(values))])
                             _: nil
+                # `describe:` + block: the callee is a free function whose only parameter is a
+                # trailing array (collect the items) or a closure (the block is its body).
+                if let fdecl = interp.get_fn_decl(ctor_name):
+                    if fdecl.params.length == 1:
+                        if let pty = fdecl.params[0].ty:
+                            match pty:
+                                Type.Array(_):
+                                    let fvalues = collect_array_block(interp, body, interp.current_env)
+                                    return call_fn(interp, fdecl, [Value.Array(fvalues)], nil)
+                                Type.Named(pn):
+                                    if pn == "__fn":
+                                        let tail = Value.Closure([], body, interp.current_env)
+                                        return call_fn(interp, fdecl, [tail], nil)
+                                _: nil
             Value.Closure(params, body, interp.current_env)
 
         # Type cast
@@ -848,7 +960,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         ExprKind.Assign(target, val_expr):
             let val0 = eval_expr(interp, val_expr)
-            let val = byvalue_store(interp, val_expr, val0)
+            let val = byvalue_store(interp, val_expr, val0, assign_dest_type(interp, target))
             # `g = f` / `p.v = f` where the slot holds a fixed-point value: only an
             # untyped literal may adopt its format.
             match val:
@@ -1066,6 +1178,10 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 # scan error (src/interpreter/eval_expr.rs) instead of silently returning whichever enum
 # happens to be registered first, which could resolve to the wrong enum with no warning.
 def Value eval_dot_ident(mut Interpreter interp, string variant_name):
+    # `.thread` / `.block` / `.grid` inside a running kernel.
+    if variant_name == "thread" or variant_name == "block" or variant_name == "grid":
+        if let kv = interp.current_env.get("__k_{variant_name}"):
+            return kv
     var found = Value.Nil
     var has_found = false
     var ambiguous = false
@@ -3044,7 +3160,11 @@ def bool expr_is_builtin_optional(Expr e):
 def Type? static_type_of(mut Interpreter interp, Expr e):
     match e.kind:
         ExprKind.Var(n):
-            interp.declared_types.get(n)
+            let depth_now = interp.return_ty_stack.length
+            let dkey = "{depth_now}:{n}"
+            if let dty = interp.declared_types.get(dkey):
+                return dty
+            self_field_type(interp, n)
         ExprKind.Field(obj, fname):
             guard let ov = eval_expr(interp, obj) as Value? else: return nil
             match ov:
@@ -3900,6 +4020,18 @@ def Value default_like_value(Value v):
         Value.Set(_): Value.Set([])
         _: Value.Nil
 
+# The declared type of field `name` of the receiver of the running method, if any.
+def Type? self_field_type(mut Interpreter interp, string name):
+    guard let sv = interp.current_env.get("self") else: return nil
+    match sv:
+        Value.Object(so):
+            guard let sd = interp.get_struct_decl(so.type_name) else: return nil
+            for f in sd.fields:
+                if f.name == name:
+                    return f.ty
+            nil
+        _: nil
+
 def void assign_target(mut Interpreter interp, Expr target, Value val):
     match target.kind:
         ExprKind.Var(name):
@@ -3919,6 +4051,9 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                                         stored = lv
                                 _: nil
                     _: nil
+                # A bare literal assigned to a field of the receiver takes the field's numeric width.
+                if let fty = self_field_type(interp, name):
+                    stored = coerce_declared_value(interp, stored, fty)
                 let ok = interp.current_env.set(name, stored)
                 if not ok:
                     throw "cannot assign to immutable variable '{name}'"
@@ -3931,32 +4066,39 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                 _: nil
             match obj:
                 Value.Object(inner):
-                    # Check for a setter method
+                    # Check for a setter method (skipped inside a setter body: `self.f = v` there
+                    # writes the field, it does not re-enter the setter)
                     let type_name = inner.type_name
                     let decl_opt = interp.get_struct_decl(type_name)
                     var setter_called = false
+                    var cval = val
                     if let decl = decl_opt:
+                        for df in decl.fields:
+                            if df.name == field_name:
+                                cval = coerce_declared_value(interp, val, df.ty)
                         var si = 0
-                        while si < decl.setters.length:
+                        while si < decl.setters.length and not interp.in_setter:
                             let s = decl.setters[si]
                             if s.name == field_name:
                                 let child_env = push_scope(interp)
                                 env_define(interp, "self", Value.Object(inner), true)
-                                env_define(interp, s.param_name, val, true)
+                                env_define(interp, s.param_name, cval, true)
+                                interp.in_setter = true
                                 _ = eval_block(interp, s.body)
+                                interp.in_setter = false
                                 pop_scope(interp)
                                 setter_called = true
                                 break
                             si = si + 1
                     if not setter_called:
-                        inner.set_field(field_name, val)
+                        inner.set_field(field_name, cval)
                         # A method scope keeps the receiver's fields as local bindings and
                         # copies them back when the method returns. Keep that local copy in
                         # sync only for an explicit `self.field` assignment. Updating an
                         # argument such as `other.value` must not overwrite the receiver's
                         # unrelated local `value` binding.
                         if is_self_var(obj_expr):
-                            interp.current_env.set(field_name, val)
+                            interp.current_env.set(field_name, cval)
                 _:
                     throw "cannot assign field on non-object"
         ExprKind.Index(obj_expr, idx_expr):

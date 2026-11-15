@@ -806,6 +806,21 @@ def Type parse_type(mut Parser p) throws:
     if p.eat(TokenKind.Mut):
         return parse_type(p)
     let base = parse_type_base(p)
+    # A bare `Fn(args)` is a closure type with a unit return (`Fn(int) onTap`): consume the
+    # signature, as `parse_fn_type` does for the `def`/`req` spellings.
+    match base:
+        Type.Named(fn_nm):
+            if fn_nm == "Fn" and parser_check(p, "LParen"):
+                p.advance()
+                while p.peek() != TokenKind.RParen and p.peek() != TokenKind.Eof:
+                    _ = parse_type(p)
+                    if p.peek() != TokenKind.RParen:
+                        _ = p.expect(TokenKind.Comma)
+                _ = p.expect(TokenKind.RParen)
+                _ = p.eat(TokenKind.Task)
+                _ = p.eat(TokenKind.Throws)
+                return Type.Named("__fn")
+        _: nil
     # Handle `T&` borrow syntax — consume `&` and treat as the base type
     if p.eat(TokenKind.Ampersand):
         return base
@@ -1176,11 +1191,12 @@ def Param parse_param(mut Parser p) throws:
             untyped_default = parse_expr(p)
         return Param(name= untyped_name.text(), ty= nil, mutable= mutable, owned= false, variadic= false, default= untyped_default, line= line)
     let base_ty = parse_type(p)
-    let ty = parse_type_qualifier(p, base_ty)
+    var ty = parse_type_qualifier(p, base_ty)
     # Handle variadic: `int... args`
     var variadic = p.eat(TokenKind.DotDotDot)
     # Handle function-type param `def int(int) f` — type(args) name — skip (args) before name
     if p.peek() == TokenKind.LParen:
+        ty = Type.Named("__fn")
         _ = p.advance()
         var depth = 1
         while depth > 0 and p.peek() != TokenKind.Eof:
@@ -1192,6 +1208,7 @@ def Param parse_param(mut Parser p) throws:
     let name_tok = p.expect(TokenKind.Ident(""))
     # Handle function-type param: `int f(int)` — name then (args) — skip the (args) part
     if p.eat(TokenKind.LParen):
+        ty = Type.Named("__fn")
         var depth = 1
         while depth > 0 and p.peek() != TokenKind.Eof:
             if p.peek() == TokenKind.LParen:
@@ -1239,9 +1256,14 @@ def TypeMethod parse_type_setter(mut Parser p, bool is_pub) throws:
 
 def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
     let line = p.current_line()
-    let decl_attrs = p.pending_attrs
+    var decl_attrs = p.pending_attrs
     p.pending_attrs = []
-    _ = p.expect(TokenKind.Struct)
+    # `kernel Name:` is a struct whose anonymous `def ():` is the per-thread entry.
+    if parser_check(p, "Kernel"):
+        _ = p.advance()
+        decl_attrs.push(Attr(name= "kernel", args= [], line= line))
+    else:
+        _ = p.expect(TokenKind.Struct)
     let name_tok = p.expect(TokenKind.Ident(""))
     let name = name_tok.text()
     # Skip optional generic params: <A, B>
@@ -1776,6 +1798,8 @@ def [Attr] parse_attrs(mut Parser p) throws:
 def Item parse_item(mut Parser p) throws:
     if parser_peek_ident(p) == "view" and parser_check2(p, "Ident"):
         return Item.Struct(parse_view_decl(p, false))
+    if parser_check(p, "Kernel") and parser_check2(p, "Ident"):
+        return Item.Struct(parse_struct_decl(p, false))
     match p.peek():
         TokenKind.At:
             # Attributes are recorded on the declaration they decorate (`@serde` drives
@@ -2228,7 +2252,7 @@ def Program parse_program(mut Parser p) throws:
 
 def Program parse(string source) throws:
     let toks = lex(source)
-    mut p'actor = Parser(tokens= toks, pos= 0, allow_noparen_closure= true, allow_trailing_closure= true, depth= 0, pending= [], bind_entries= [], pending_attrs= [])
+    mut p'actor = Parser(tokens= toks, pos= 0, allow_noparen_closure= true, allow_trailing_closure= true, depth= 0, pending= [], bind_entries= ["Toggle.value", "TextField.value", "Sheet.isPresented", "Popover.isPresented", "DragSource.value", "OnDragOver.value", "OnDrop.value", "OnHover.value", "OnContext.value", "OnSwipe.value", "OnPan.value", "Focused.value", "FocusedAs.value", "List.selection", "MultiList.selection", "Slider.value"], pending_attrs= [])
     parse_program(p)
 # ── AST builder helpers ────────────────────────────────────────────────────────
 
@@ -2730,7 +2754,7 @@ def SkipResult? peek_dot_after_newlines_and_indents(mut Parser p):
     result
 
 def Parser'actor make_parser([Token] tokens):
-    let p'actor = Parser(tokens= tokens, pos= 0, allow_noparen_closure= true, allow_trailing_closure= true, depth= 0, pending= [], bind_entries= [], pending_attrs= [])
+    let p'actor = Parser(tokens= tokens, pos= 0, allow_noparen_closure= true, allow_trailing_closure= true, depth= 0, pending= [], bind_entries= ["Toggle.value", "TextField.value", "Sheet.isPresented", "Popover.isPresented", "DragSource.value", "OnDragOver.value", "OnDrop.value", "OnHover.value", "OnContext.value", "OnSwipe.value", "OnPan.value", "Focused.value", "FocusedAs.value", "List.selection", "MultiList.selection", "Slider.value"], pending_attrs= [])
     p
 
 def LoopStmt parse_loop_stmt(mut Parser p) throws:

@@ -35,6 +35,11 @@ struct Interpreter:
     # `type let|var` values, keyed "Owner::name"; `in_type_setter` stops a `type set` body re-entering itself.
     var {string=Value} type_var_store = {}
     var bool in_type_setter = false
+    # True while a field setter body runs, so `self.f = v` inside it writes the field.
+    var bool in_setter = false
+    # Static site numbering of the `[View]` array block being collected (see `collect_array_block_stmts`).
+    var bool block_site_on = false
+    var int block_site = 0
     # Declared (or inferred-optional) type of each `let` name, only used to render `{x:?}` of optionals.
     var {string=Type} declared_types = {}
     # `use a.b.c` resolution state — a reduced-scope port of the real
@@ -761,6 +766,9 @@ def Interpreter'actor new_interpreter():
         observed_next_id = 0,
         type_var_store = {},
         in_type_setter = false,
+        in_setter = false,
+        block_site_on = false,
+        block_site = 0,
         declared_types = {},
         net = Sockets(listeners = {}, streams = {}, next_id = 0),
         return_ty_stack = [],

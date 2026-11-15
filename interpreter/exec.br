@@ -209,22 +209,26 @@ def Value eval_cond_in_env(mut Interpreter interp, Env'actor env, Expr expr):
 # Remembers the declared type of a `let` (or that it holds a built-in optional) for `{x:?}`.
 def void record_let_type(mut Interpreter interp, LetStmt s):
     mut {string=Type} dt = interp.declared_types
+    # Keyed by call depth, so a same-named local of another function never shares the entry.
+    let depth_now = interp.return_ty_stack.length
+    let dkey = "{depth_now}:{s.name}"
     if let ty = s.ty:
-        dt.set(s.name, ty)
+        dt.set(dkey, ty)
     else:
         var is_opt = false
         if let e = s.value:
             is_opt = expr_is_builtin_optional(e)
         if is_opt:
-            dt.set(s.name, Type.Optional(Type.Named("_")))
+            dt.set(dkey, Type.Optional(Type.Named("_")))
         else:
-            dt.remove(s.name)
+            dt.remove(dkey)
     interp.declared_types = dt
 
 def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
     match stmt:
         Let(s):
             record_let_type(interp, s)
+            mark_alias_binding(interp, s.name, s.ty)
             var val = Uninitialized
             var string? move_source = nil
             if let expr = s.value:
@@ -1031,6 +1035,275 @@ def Signal? exec_try(mut Interpreter interp, TryStmt s):
     else:
         body_sig
 
+# ─── kernels ─────────────────────────────────────────────────────────────────────
+# `kernel K:` is a struct whose anonymous `def ():` (the method `__call__`) is the per-thread body.
+# `k(block = B, grid = G)` runs it for every thread of every block, sequentially: the fields live in
+# one shared scope, each thread has its own child scope (its `let`s, `.thread`/`.block`/`.grid`), and
+# a top-level `sync` splits the body into phases that every thread of a block finishes before the next.
+
+def (int, int, int) kernel_dims(Value v):
+    match v:
+        Value.Int(n): (n, 1, 1)
+        Value.Uint(n): (n as int, 1, 1)
+        Value.Tuple(items):
+            var kx = 1
+            var ky = 1
+            var kz = 1
+            var ki = 0
+            while ki < items.length:
+                var kn = 1
+                match items[ki]:
+                    Value.Int(n): kn = n
+                    Value.Uint(n): kn = n as int
+                    _: nil
+                if ki == 0:
+                    kx = kn
+                elif ki == 1:
+                    ky = kn
+                else:
+                    kz = kn
+                ki = ki + 1
+            (kx, ky, kz)
+        _: (1, 1, 1)
+
+def Value kernel_dim_value(int x, int y, int z):
+    Value.Object(ObjectInner(type_name= "__Dim3", fields= [("x", Value.Int(x)), ("y", Value.Int(y)), ("z", Value.Int(z))]))
+
+# A big array a kernel only reads is kept in 256-element chunks (`__ArrayRef`): every thread reads
+# it, and reading an element of a plain array copies the whole array.
+def Value chunk_array(Value arr):
+    match arr:
+        Value.Array(items):
+            mut [(string, Value)] chunks = [("n", Value.Int(items.length))]
+            var start = 0
+            var k = 0
+            while start < items.length:
+                mut [Value] chunk = []
+                var j = start
+                while j < items.length and j < start + 256:
+                    chunk.push(items[j])
+                    j = j + 1
+                chunks.push(("c{k}", Value.Array(chunk)))
+                start = start + 256
+                k = k + 1
+            Value.Object(ObjectInner(type_name= "__ArrayRef", fields= chunks))
+        _: arr
+
+def Value chunked_array_get(ObjectInner'actor chunked_obj, Value idx):
+    var at = 0
+    match idx:
+        Value.Int(n): at = n
+        Value.Uint(n): at = n as int
+        _: throw "array index must be an integer"
+    let ck = "c{at / 256}"
+    if at >= 0:
+        if let chunk = chunked_obj.get_field(ck):
+            match chunk:
+                Value.Array(items):
+                    let within = at % 256
+                    if within < items.length:
+                        return items[within]
+                _: nil
+    throw "array index {at} out of bounds"
+
+# Does `name` appear as the root of an assignment target (or anything this scan does not understand)?
+def bool expr_may_write(mut Interpreter interp, Expr e, string name):
+    match e.kind:
+        ExprKind.Assign(target, value):
+            if target_root_is(target, name):
+                return true
+            return expr_may_write(interp, value, name)
+        ExprKind.Int(_): false
+        ExprKind.UInt64(_): false
+        ExprKind.Float(_): false
+        ExprKind.Str(_): false
+        ExprKind.Bool(_): false
+        ExprKind.Nil: false
+        ExprKind.Var(_): false
+        ExprKind.DotIdent(_): false
+        ExprKind.BinOp(_, l, r): expr_may_write(interp, l, name) or expr_may_write(interp, r, name)
+        ExprKind.UnaryOp(_, x): expr_may_write(interp, x, name)
+        ExprKind.Field(x, _): expr_may_write(interp, x, name)
+        ExprKind.Index(a, i): expr_may_write(interp, a, name) or expr_may_write(interp, i, name)
+        ExprKind.Cast(x, _): expr_may_write(interp, x, name)
+        ExprKind.Tuple(elems):
+            for el in elems:
+                if expr_may_write(interp, el, name):
+                    return true
+            false
+        ExprKind.Call(callee, args):
+            for a in args:
+                if expr_may_write(interp, a.value, name):
+                    return true
+            false
+        ExprKind.MethodCall(recv, _, args):
+            if target_root_is(recv, name):
+                return true
+            for a in args:
+                if expr_may_write(interp, a.value, name):
+                    return true
+            false
+        _: true
+
+def bool target_root_is(Expr t, string name):
+    match t.kind:
+        ExprKind.Var(n): n == name
+        ExprKind.Index(a, _): target_root_is(a, name)
+        ExprKind.Field(a, _): target_root_is(a, name)
+        _: false
+
+def bool stmts_may_write(mut Interpreter interp, [Stmt] stmts, string name):
+    for st in stmts:
+        match st:
+            Stmt.Expr(e):
+                if expr_may_write(interp, e, name):
+                    return true
+            Stmt.Let(l):
+                if let lv = l.value:
+                    if expr_may_write(interp, lv, name):
+                        return true
+            Stmt.If(ifs):
+                for br in ifs.branches:
+                    if expr_may_write(interp, br.cond, name) or stmts_may_write(interp, br.body, name):
+                        return true
+                if let eb = ifs.else_body:
+                    if stmts_may_write(interp, eb, name):
+                        return true
+            Stmt.For(f):
+                if expr_may_write(interp, f.iterable, name) or stmts_may_write(interp, f.body, name):
+                    return true
+            _: return true
+    false
+
+def bool stmt_is_sync(Stmt st):
+    match st:
+        Stmt.Expr(e):
+            match e.kind:
+                ExprKind.Var(n): n == "sync"
+                _: false
+        _: false
+
+def Env'actor make_thread_env(Env? shared, Value thread_dim, Value block_dim, Value grid_dim):
+    mut e = new_env(shared)
+    e.define_mut("__k_thread", thread_dim)
+    e.define_mut("__k_block", block_dim)
+    e.define_mut("__k_grid", grid_dim)
+    e
+
+def Value run_kernel(mut Interpreter interp, Value kself, [Value] args):
+    match kself:
+        Value.Object(ko): return run_kernel_inner(interp, kself, ko, args)
+        _: throw "not a kernel"
+
+def Value run_kernel_inner(mut Interpreter interp, Value kself, ObjectInner'actor kobj, [Value] args):
+    guard let decl = interp.get_struct_decl(kobj.type_name) else: throw "kernel not found"
+    var FnDecl? entry_opt = nil
+    for m in decl.methods:
+        if m.name == "__call__":
+            entry_opt = m
+    guard let entry = entry_opt else: throw "kernel '{kobj.type_name}' has no `def ():` body"
+    var bx = 1
+    var by = 1
+    var bz = 1
+    var gx = 1
+    var gy = 1
+    var gz = 1
+    for a in args:
+        match a:
+            Value.Labeled(lname, lval):
+                if lname == "block":
+                    let bd = kernel_dims(lval)
+                    bx = bd.0
+                    by = bd.1
+                    bz = bd.2
+                elif lname == "grid":
+                    let gd = kernel_dims(lval)
+                    gx = gd.0
+                    gy = gd.1
+                    gz = gd.2
+            _: nil
+    # The body, cut at each top-level `sync`.
+    mut [[Stmt]] phases = []
+    mut [Stmt] current = []
+    for st in entry.body:
+        if stmt_is_sync(st):
+            phases.push(current)
+            current = []
+        else:
+            current.push(st)
+    phases.push(current)
+    let saved_env = interp.current_env
+    mut shared = new_env(interp.global_env)
+    mut [string] chunked_names = []
+    for f in kobj.fields:
+        var stored = f.1
+        match f.1:
+            Value.Array(big_items):
+                if big_items.length >= 512 and not stmts_may_write(interp, entry.body, f.0):
+                    stored = chunk_array(f.1)
+                    chunked_names.push(f.0)
+            _: nil
+        shared.define_mut(f.0, stored)
+    shared.define_mut("self", kself)
+    let shared_holder = Value.Closure([], ClosureBody.Block([]), shared)
+    let grid_val = kernel_dim_value(gx, gy, gz)
+    let prev_kernel = interp.in_kernel_context
+    interp.in_kernel_context = true
+    var failed = false
+    var gzi = 0
+    while gzi < gz and not failed:
+        var gyi = 0
+        while gyi < gy and not failed:
+            var gxi = 0
+            while gxi < gx and not failed:
+                let block_val = kernel_dim_value(gxi, gyi, gzi)
+                mut [Value] threads = []
+                var tz = 0
+                while tz < bz:
+                    var ty = 0
+                    while ty < by:
+                        var tx = 0
+                        while tx < bx:
+                            match shared_holder:
+                                Value.Closure(_, _, shcap):
+                                    threads.push(Value.Closure([], ClosureBody.Block([]), make_thread_env(shcap, kernel_dim_value(tx, ty, tz), block_val, grid_val)))
+                                _: nil
+                            tx = tx + 1
+                        ty = ty + 1
+                    tz = tz + 1
+                for phase in phases:
+                    for tval in threads:
+                        if not failed:
+                            match tval:
+                                Value.Closure(_, _, tcap):
+                                    if let tenv = tcap:
+                                        interp.current_env = tenv
+                                _: nil
+                            _ = eval_block(interp, phase)
+                            if interp.has_pending_throw:
+                                failed = true
+                gxi = gxi + 1
+            gyi = gyi + 1
+        gzi = gzi + 1
+    interp.in_kernel_context = prev_kernel
+    interp.current_env = saved_env
+    match kself:
+        Value.Object(wb):
+            match shared_holder:
+                Value.Closure(_, _, wcap):
+                    if let wenv = wcap:
+                        for f in kobj.fields:
+                            if not chunked_names.contains(f.0):
+                                if let nv = wenv.get(f.0):
+                                    wb.set_field(f.0, nv)
+                _: nil
+        _: nil
+    Value.Void
+
+def bool decl_is_kernel(StructDecl decl):
+    attrs_have(decl.attrs, "kernel")
+
+
 # ─── exec_kernel_block ────────────────────────────────────────────────────────
 #
 # Executes the body of a `kernel:` block.
@@ -1191,6 +1464,7 @@ def Value call_fn_body(mut Interpreter interp, FnDecl decl, [Value] args, Env'ac
                     coerce_declared_value(interp, val, ty)
                 fn_env.force_set(param_name, coerced.clone())
                 mark_byvalue_param(interp, param, coerced)
+                mark_alias_binding(interp, param.name, param.ty)
     let prev_env = interp.current_env
     interp.current_env = fn_env
     # Push this call's declared return type so `return .Left` (exec_stmt's Return case)
@@ -1290,53 +1564,136 @@ def Value call_closure(mut Interpreter interp, [Param] params, ClosureBody body,
 # desugars this syntax before evaluation; the self-hosted parser currently
 # represents the same block as the constructor's final closure argument, so
 # collect its expression statements (and control-flow bodies) here.
+# The key of a `for` inside an array block: its explicit `with` key, else `item.id()` when the
+# element is `Identifiable`; nil for a plain unkeyed loop. Runs in the loop's scope.
+def Value? array_block_key(mut Interpreter interp, ForStmt for_stmt, Value item):
+    if let key_expr = for_stmt.key:
+        return eval_expr(interp, key_expr)
+    match item:
+        Value.Object(io):
+            if let sd = interp.get_struct_decl(io.type_name):
+                for proto in sd.protocols:
+                    if proto == "Identifiable":
+                        return call_method(interp, item, "id", [])
+            nil
+        _: nil
+
+# ── static site numbering (`Sited`) ────────────────────────────────────────────
+# A `[View]` array block with `if`/`for` control flow tags each pushed element with its position
+# in the block's source: `Sited(site = n, children = [element])`, numbered in preorder, one number
+# per element expression and per keyed `for` (not per iteration), whichever branch runs.
+
+def bool block_has_control_flow([Stmt] stmts):
+    for st in stmts:
+        match st:
+            Stmt.If(_): return true
+            Stmt.For(_): return true
+            _: nil
+    false
+
+# How many site numbers `stmts` consumes (a branch that does not run still takes its share).
+def int count_site_items(mut Interpreter interp, [Stmt] stmts):
+    var n = 0
+    for st in stmts:
+        match st:
+            Stmt.Expr(_): n = n + 1
+            Stmt.If(ifs):
+                for br in ifs.branches:
+                    n = n + count_site_items(interp, br.body)
+                if let eb = ifs.else_body:
+                    n = n + count_site_items(interp, eb)
+            Stmt.For(fs):
+                if let _ = fs.key:
+                    n = n + 1
+            _: nil
+    n
+
+def bool value_is_view(mut Interpreter interp, Value v):
+    match v:
+        Value.Object(o):
+            if let sd = interp.get_struct_decl(o.type_name):
+                return decl_is_view(sd)
+            false
+        _: false
+
+def Value site_wrap(mut Interpreter interp, Value elem):
+    if not interp.block_site_on:
+        return elem
+    if not value_is_view(interp, elem):
+        return elem
+    guard let sited = interp.get_struct_decl("Sited") else: return elem
+    let site_no = interp.block_site
+    interp.block_site = site_no + 1
+    instantiate_struct(interp, sited, [Value.Labeled("site", Value.Int(site_no)), Value.Labeled("children", Value.Array([elem]))])
+
+# The body of one `for` iteration: its items, grouped under their key when the loop is keyed.
+def [Value] collect_for_iteration(mut Interpreter interp, ForStmt for_stmt, Value item, int site_no):
+    let child = push_scope(interp)
+    if for_stmt.vars.length > 0:
+        env_define(interp, for_stmt.vars[0], item, false)
+    mut [Value] out = []
+    let saved_on = interp.block_site_on
+    let saved_site = interp.block_site
+    var key_opt = array_block_key(interp, for_stmt, item)
+    var keyed = false
+    if let _ = key_opt:
+        keyed = true
+    # An unkeyed loop keeps positional identity: its items are not tagged. A keyed loop numbers its
+    # own items afresh.
+    interp.block_site_on = saved_on and keyed
+    interp.block_site = 0
+    let nested = collect_array_block_stmts(interp, for_stmt.body)
+    interp.block_site_on = saved_on
+    interp.block_site = saved_site
+    if let key = key_opt:
+        let keyed_decl_opt = interp.get_struct_decl("KeyedGroup")
+        if let keyed_decl = keyed_decl_opt:
+            let group = instantiate_struct(interp, keyed_decl, [Value.Str(display_value(interp, key)), Value.Array(nested)])
+            out.push(site_wrap(interp, group))
+        else:
+            throw "keyed array block requires a KeyedGroup struct"
+    else:
+        for value in nested:
+            out.push(value)
+    pop_scope(interp)
+    out
+
 def [Value] collect_array_block_stmts(mut Interpreter interp, [Stmt] stmts):
     mut [Value] out = []
     for stmt in stmts:
         match stmt:
             Stmt.Expr(e):
-                out.push(eval_expr(interp, e))
+                out.push(site_wrap(interp, eval_expr(interp, e)))
             Stmt.For(for_stmt):
                 let iterable = eval_expr(interp, for_stmt.iterable)
+                # One number for a keyed loop, taken once (all iterations share it).
+                var loop_keyed = false
+                if let _ = for_stmt.key:
+                    loop_keyed = true
+                let loop_site = interp.block_site
+                var iterations = 0
                 match iterable:
                     Value.Array(items):
                         for item in items:
-                            let child = push_scope(interp)
-                            if for_stmt.vars.length > 0:
-                                env_define(interp, for_stmt.vars[0], item, false)
-                            let nested = collect_array_block_stmts(interp, for_stmt.body)
-                            if let key_expr = for_stmt.key:
-                                let key = eval_expr(interp, key_expr)
-                                let keyed_decl_opt = interp.get_struct_decl("KeyedGroup")
-                                if let keyed_decl = keyed_decl_opt:
-                                    out.push(instantiate_struct(interp, keyed_decl, [key, Value.Array(nested)]))
-                                else:
-                                    throw "keyed array block requires a KeyedGroup struct"
-                            else:
-                                for value in nested:
-                                    out.push(value)
-                            pop_scope(interp)
+                            interp.block_site = loop_site
+                            let part = collect_for_iteration(interp, for_stmt, item, loop_site)
+                            for value in part:
+                                out.push(value)
+                            iterations = iterations + 1
                     Value.Range(start, end, inclusive, _):
                         let limit = if inclusive: end + 1 else: end
                         var n = start
                         while n < limit:
-                            let child = push_scope(interp)
-                            if for_stmt.vars.length > 0:
-                                env_define(interp, for_stmt.vars[0], Value.Int(n), false)
-                            let nested = collect_array_block_stmts(interp, for_stmt.body)
-                            if let key_expr = for_stmt.key:
-                                let key = eval_expr(interp, key_expr)
-                                let keyed_decl_opt = interp.get_struct_decl("KeyedGroup")
-                                if let keyed_decl = keyed_decl_opt:
-                                    out.push(instantiate_struct(interp, keyed_decl, [key, Value.Array(nested)]))
-                                else:
-                                    throw "keyed array block requires a KeyedGroup struct"
-                            else:
-                                for value in nested:
-                                    out.push(value)
-                            pop_scope(interp)
+                            interp.block_site = loop_site
+                            let part = collect_for_iteration(interp, for_stmt, Value.Int(n), loop_site)
+                            for value in part:
+                                out.push(value)
+                            iterations = iterations + 1
                             n += 1
                     _: throw "array block for-loop requires an iterable"
+                # A keyed loop that never ran still owns its number.
+                if iterations == 0 and loop_keyed:
+                    interp.block_site = loop_site + 1
             Stmt.If(if_stmt):
                 var matched = false
                 for branch in if_stmt.branches:
@@ -1345,20 +1702,37 @@ def [Value] collect_array_block_stmts(mut Interpreter interp, [Stmt] stmts):
                         for value in nested:
                             out.push(value)
                         matched = true
-                if not matched:
-                    if let else_body = if_stmt.else_body:
+                    else:
+                        interp.block_site = interp.block_site + count_site_items(interp, branch.body)
+                if let else_body = if_stmt.else_body:
+                    if not matched:
                         let nested = collect_array_block_stmts(interp, else_body)
                         for value in nested:
                             out.push(value)
+                    else:
+                        interp.block_site = interp.block_site + count_site_items(interp, else_body)
             _: throw "unsupported statement in trailing array block"
     out
 
 def [Value] collect_array_block(mut Interpreter interp, ClosureBody body, Env? captured):
     let prev_env = interp.current_env
     interp.current_env = new_env(captured)
-    let values = match body:
-        ClosureBody.Block(stmts): collect_array_block_stmts(interp, stmts)
-        ClosureBody.Expr(e): [eval_expr(interp, e)]
+    let saved_site_on = interp.block_site_on
+    let saved_site = interp.block_site
+    mut [Value] values = []
+    match body:
+        ClosureBody.Block(stmts):
+            var tagged = false
+            if block_has_control_flow(stmts):
+                if let _ = interp.get_struct_decl("Sited"):
+                    tagged = true
+            interp.block_site_on = tagged
+            interp.block_site = 0
+            values = collect_array_block_stmts(interp, stmts)
+        ClosureBody.Expr(e):
+            values = [eval_expr(interp, e)]
+    interp.block_site_on = saved_site_on
+    interp.block_site = saved_site
     interp.current_env = prev_env
     values
 
@@ -1411,6 +1785,10 @@ def Value call_value(mut Interpreter interp, Value callee, [Value] args):
             Value.EnumVariant(type_name, variant, args)
 
         Value.Object(obj):
+            # A `kernel` instance launched as `k(block = ..., grid = ...)`.
+            if let kdecl = interp.get_struct_decl(obj.type_name):
+                if decl_is_kernel(kdecl):
+                    return run_kernel(interp, callee, args)
             # Callable struct: look for __call__ method
             let obj_type = obj.type_name
             let method_opt = interp.find_best_method(obj_type, "__call__", args)

@@ -158,14 +158,14 @@ struct Sockets:
 
     def int bind(string addr) throws:
         let r = try? TcpListener.bind(addr)
-        guard let listener = r else throw "bind failed"
+        guard let listener = r else throw "bind {addr} failed"
         self.next_id = self.next_id + 1
         self.listeners.set(self.next_id, listener)
         self.next_id
 
     def int connect(string addr) throws:
         let r = try? TcpStream.connect(addr)
-        guard let st = r else throw "connect failed"
+        guard let st = r else throw "connect {addr} failed"
         self.next_id = self.next_id + 1
         self.streams.set(self.next_id, st)
         self.next_id

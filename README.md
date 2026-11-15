@@ -67,16 +67,16 @@ Status against the `boring` checkout of 2026-11-12: 10/10 transpile smoke tests,
 
 ### Parity
 
-`tools/interpreter_parity.py` runs the Rust interpreter and these binaries over the fixtures registered in `boring`'s `tests/transpile.rs` and compares each output with the `.expected` file. On 2026-11-15, with a 6 s timeout, over 374 simple fixtures:
+`tools/interpreter_parity.py` runs the Rust interpreter and these binaries over the fixtures registered in `boring`'s `tests/transpile.rs` and compares each output with the `.expected` file. On 2026-11-15, with a 6 s timeout, over 379 simple fixtures:
 
 | | ok | error | different output | timeout |
 |---|---:|---:|---:|---:|
-| Rust interpreter (`boring run`) | 373 | 1 | 0 | 0 |
-| This interpreter (strict + multi) | 374 | 0 | 0 | 0 |
+| Rust interpreter (`boring run`) | 378 | 1 | 0 | 0 |
+| This interpreter (strict + multi) | 379 | 0 | 0 | 0 |
 
 Every registered fixture passes (the Rust interpreter still fails `misc_scenarios_10`). Notable pieces: raw `std.net` sockets live in a `Sockets` actor, since `TcpListener`/`TcpStream` are not `Clone` (needs the `boring` fix `fa9fdb9f`); reflection exchanges values through the built-in `FieldValue` enum, with `type let`/`type var`/`type set`; `{x:?}` of an optional prints `Some(v)`/`None` from the static type of the hole (declared `let` types, struct fields, built-in optional calls), since optionals are transparent at run time.
 
-The numbers measure this corpus, not a percentage of the language. [`docs/interpreter-parity.md`](docs/interpreter-parity.md) (in French, written before this work) has the architecture and a historical gap analysis. `tools/bench_interpreters.sh` compares timings.
+The numbers measure this corpus, not a percentage of the language. On the 86 other `tests/cases` fixtures that `transpile.rs` does not register (`--unregistered`), 84 pass; the 2 left (a quadratic `push` loop) and the gaps closed so far are described in [`docs/interpreter-parity.md`](docs/interpreter-parity.md), which also describes the architecture. `tools/check.sh` runs the whole check (build, both corpora, the three suites) and prints the `boring` commit under test. `tools/bench_interpreters.sh` compares timings.
 
 ## Layout
 
@@ -90,7 +90,7 @@ interpreter/       the interpreter, a Boring project
 cases/             fixtures used only by this interpreter
 tests/             the three suites above, shared helpers in tests/common
 tools/             parity tool, benchmark
-docs/              parity audit
+docs/              parity audit and known gaps
 ```
 
 ## Why it is a useful regression guard for `boring`

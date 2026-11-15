@@ -43,6 +43,18 @@ def run(command, timeout, expected, env=None):
     return {"status": "ok"}
 
 
+def boring_revision():
+    """The commit of the `boring` checkout under test, `+dirty` when its tree has local changes."""
+    try:
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                             text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
+                               capture_output=True, text=True, check=True).stdout.strip()
+        return rev + ("+dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cases", nargs="*", help="registered fixture names (default: all)")
@@ -50,6 +62,8 @@ def main():
     parser.add_argument("--build-timeout", type=float, default=180)
     parser.add_argument("--all-modes", action="store_true", help="check all four Boring binaries")
     parser.add_argument("--transpile", action="store_true", help="also compile/run strict+multi Rust")
+    parser.add_argument("--unregistered", action="store_true",
+                        help="check the tests/cases fixtures with an .expected file that transpile.rs does not register")
     parser.add_argument("--output", type=Path, help="write detailed JSON results")
     args = parser.parse_args()
     if args.timeout <= 0 or args.build_timeout <= 0:
@@ -58,7 +72,11 @@ def main():
                                          (ROOT / "tests/transpile.rs").read_text(), re.M)))
     names = [n for n in names if (ROOT / f"tests/cases/{n}.br").is_file()
              and (ROOT / f"tests/cases/{n}.expected").is_file()]
-    if args.cases:
+    if args.unregistered:
+        registered = set(names)
+        names = sorted(p.stem for p in (ROOT / "tests/cases").glob("*.br")
+                       if p.stem not in registered and p.with_suffix(".expected").is_file())
+    elif args.cases:
         unknown = set(args.cases) - set(names)
         if unknown:
             parser.error(f"unregistered fixtures: {', '.join(sorted(unknown))}")
@@ -81,6 +99,8 @@ def main():
             parser.error(f"missing {binary}; run the build prerequisites")
     for label, binary in bins.items():
         print(f"using {label}: {binary}", flush=True)
+    boring_rev = boring_revision()
+    print(f"boring: {boring_rev}", flush=True)
     rows = []
     for name in names:
         fixture = ROOT / f"tests/cases/{name}.br"
@@ -118,7 +138,7 @@ def main():
                        for status in ("ok", "error", "output", "timeout")} for label in labels}
     print(json.dumps(summary, indent=2))
     if args.output:
-        args.output.write_text(json.dumps({"timeout": args.timeout, "summary": summary, "cases": rows},
+        args.output.write_text(json.dumps({"timeout": args.timeout, "boring": boring_rev, "summary": summary, "cases": rows},
                                          ensure_ascii=False, indent=2) + "\n")
     return int(any(r[label]["status"] != "ok" for r in rows for label in labels))
 

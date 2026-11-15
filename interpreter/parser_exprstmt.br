@@ -854,6 +854,16 @@ def Expr parse_primary(mut Parser p) throws:
     if parser_check(p, "LBracket"):
         parser_advance(p)
         parser_skip_newlines_and_indent(p)
+        # `[..<n]` / `[..=n]`: an array of n (n + 1) zeroed elements.
+        if parser_check(p, "DotDotLt") or parser_check(p, "DotDotEq"):
+            let alloc_inclusive = parser_check(p, "DotDotEq")
+            parser_advance(p)
+            var alloc_count = parse_expr(p)
+            if alloc_inclusive:
+                alloc_count = make_binop("Add", alloc_count, make_int_expr(1, line), line)
+            parser_skip_newlines_and_indent(p)
+            parser_expect(p, "RBracket")
+            return make_array_fill(make_int_expr(0, line), alloc_count, line)
         if not parser_check(p, "RBracket") and not parser_check(p, "Eof"):
             let first = parse_expr(p)
             if parser_eat(p, "For"):

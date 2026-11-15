@@ -947,6 +947,294 @@ def Value? view_modifier_call(mut Interpreter interp, Value recv, string method_
         return instantiate_struct(interp, mdecl, ctor_args)
     nil
 
+# ─── dirty reports of a view callback ────────────────────────────────────────────
+# A callback a view body hands to a control reports, before it runs, what it may change to the
+# owner of the state it closes over (`StateOwner` -> `DirtySink`): `touch` when it provably reaches
+# nothing but that view's own `state` (and the own methods it calls), `escalate` otherwise (an
+# input, an `env`, a free function), so the runtime keeps the whole-window rebuild. A write through
+# a `bind` also touches the owner of the bound slot. Mirrors `report_callbacks` in
+# src/lower_view.rs, done here when the callback runs instead of by rewriting the body.
+
+struct CbScan:
+    var bool bad = false
+    var [string] locals
+    var [string] calls
+    var [string] used_binds
+    [string] outside
+    [string] own
+    [string] binds
+
+def void scan_args(mut CbScan'actor sc, [Arg] args):
+    for a in args:
+        scan_expr(sc, a.value)
+
+def void scan_stmts(mut CbScan'actor sc, [Stmt] stmts):
+    for st in stmts:
+        match st:
+            Stmt.Let(l):
+                sc.locals.push(l.name)
+                if let lv = l.value:
+                    scan_expr(sc, lv)
+            Stmt.Expr(e): scan_expr(sc, e)
+            Stmt.For(f):
+                for fv in f.vars:
+                    sc.locals.push(fv)
+                scan_expr(sc, f.iterable)
+                scan_stmts(sc, f.body)
+            Stmt.If(ifs):
+                for br in ifs.branches:
+                    scan_expr(sc, br.cond)
+                    scan_stmts(sc, br.body)
+                if let eb = ifs.else_body:
+                    scan_stmts(sc, eb)
+            Stmt.Return(r):
+                if let rv = r.value:
+                    scan_expr(sc, rv)
+            _: sc.bad = true
+
+def void scan_expr(mut CbScan'actor sc, Expr e):
+    match e.kind:
+        ExprKind.Int(_): nil
+        ExprKind.UInt64(_): nil
+        ExprKind.Float(_): nil
+        ExprKind.Str(_): nil
+        ExprKind.Bool(_): nil
+        ExprKind.Nil: nil
+        ExprKind.Void: nil
+        ExprKind.DotIdent(_): nil
+        ExprKind.Var(n):
+            if n == "__st" or sc.locals.contains(n):
+                return
+            if n == "self":
+                sc.bad = true
+            elif sc.binds.contains(n):
+                if not sc.used_binds.contains(n):
+                    sc.used_binds.push(n)
+            elif sc.outside.contains(n):
+                sc.bad = true
+        ExprKind.BinOp(_, l, r):
+            scan_expr(sc, l)
+            scan_expr(sc, r)
+        ExprKind.UnaryOp(_, x): scan_expr(sc, x)
+        ExprKind.Assign(t, v):
+            scan_expr(sc, t)
+            scan_expr(sc, v)
+        ExprKind.Field(x, _): scan_expr(sc, x)
+        ExprKind.Index(a, i):
+            scan_expr(sc, a)
+            scan_expr(sc, i)
+        ExprKind.Cast(x, _): scan_expr(sc, x)
+        ExprKind.Array(elems):
+            for el in elems:
+                scan_expr(sc, el)
+        ExprKind.Tuple(elems):
+            for el in elems:
+                scan_expr(sc, el)
+        ExprKind.StringInterp(segs):
+            for seg in segs:
+                match seg:
+                    StringSegment.Expr(x): scan_expr(sc, x)
+                    StringSegment.FormattedExpr(x, _): scan_expr(sc, x)
+                    _: nil
+        ExprKind.Call(callee, args):
+            match callee.kind:
+                ExprKind.Var(cn):
+                    let first = cn.slice(0, 1)
+                    let lowercase = ord(first) >= 97 and ord(first) <= 122
+                    if cn != "print" and lowercase and not sc.locals.contains(cn):
+                        sc.bad = true
+                _: scan_expr(sc, callee)
+            scan_args(sc, args)
+        ExprKind.MethodCall(recv, m, args):
+            var recv_is_self = false
+            match recv.kind:
+                ExprKind.Var(rn):
+                    if rn == "self":
+                        recv_is_self = true
+                _: nil
+            if recv_is_self:
+                if sc.own.contains(m):
+                    if not sc.calls.contains(m):
+                        sc.calls.push(m)
+                else:
+                    sc.bad = true
+            else:
+                scan_expr(sc, recv)
+            scan_args(sc, args)
+        ExprKind.Closure(ps, _, cbody, _, _):
+            for cp in ps:
+                sc.locals.push(cp.name)
+            match cbody:
+                ClosureBody.Expr(ce): scan_expr(sc, ce)
+                ClosureBody.Block(cs): scan_stmts(sc, cs)
+        _: sc.bad = true
+
+# (stays in state, own methods called, binds reached) of one body.
+def (bool, [string], [string]) scan_callback_body(mut Interpreter interp, [string] params, [Stmt] stmts, [string] outside, [string] own, [string] binds):
+    var sc'actor = CbScan(locals= params, calls= [], used_binds= [], outside= outside, own= own, binds= binds)
+    scan_stmts(sc, stmts)
+    # One field per statement: reading several fields of an actor in one expression deadlocks.
+    let was_bad = sc.bad
+    let called = sc.calls
+    let reached = sc.used_binds
+    (not was_bad, called, reached)
+
+# Reports a view callback to the owner of its state; no owner attached means nothing to report.
+def void report_view_callback(mut Interpreter interp, Value hv):
+    match hv:
+        Value.Closure(cparams, cbody, hcap):
+            guard let hc = hcap else: return
+            guard let st_v = hc.get("__st") else: return
+            guard let self_v = hc.get("self") else: return
+            var Value? owner_opt = nil
+            match st_v:
+                Value.Object(st_o): owner_opt = st_o.get_field("__owner")
+                _: return
+            guard let owner_v = owner_opt else: return
+            var ObjectInner'actor? self_o = nil
+            match self_v:
+                Value.Object(so): self_o = so
+                _: return
+            guard let view_o = self_o else: return
+            guard let decl = interp.get_struct_decl(view_o.type_name) else: return
+            mut [string] binds = []
+            for attr in decl.attrs:
+                if attr.name == "bind":
+                    for bn in attr.args:
+                        binds.push(bn)
+            mut [string] outside = []
+            for f in decl.fields:
+                if not binds.contains(f.name):
+                    outside.push(f.name)
+            mut [string] own = []
+            for m in decl.methods:
+                if m.name != "body":
+                    own.push(m.name)
+            # Which own methods stay in state: a fixpoint, since they call each other.
+            mut [string] m_names = []
+            mut [[string]] m_calls = []
+            mut [[string]] m_binds = []
+            mut [string] local_ok = []
+            for m in decl.methods:
+                if m.name == "body":
+                    continue
+                mut mparams = []
+                for mp in m.params:
+                    mparams.push(mp.name)
+                let scanned = scan_callback_body(interp, mparams, m.body, outside, own, binds)
+                m_names.push(m.name)
+                m_calls.push(scanned.1)
+                m_binds.push(scanned.2)
+                if scanned.0:
+                    local_ok.push(m.name)
+            var changed = true
+            while changed:
+                changed = false
+                mut [string] kept = []
+                for n in local_ok:
+                    var all_in = true
+                    var ni = 0
+                    while ni < m_names.length:
+                        if m_names[ni] == n:
+                            for c in m_calls[ni]:
+                                if not local_ok.contains(c):
+                                    all_in = false
+                        ni = ni + 1
+                    if all_in:
+                        kept.push(n)
+                    else:
+                        changed = true
+                local_ok = kept
+            mut [string] cnames = []
+            for cp in cparams:
+                cnames.push(cp.name)
+            var [Stmt] cstmts = []
+            match cbody:
+                ClosureBody.Expr(ce): cstmts = [Stmt.Expr(ce)]
+                ClosureBody.Block(cs): cstmts = cs
+            let result = scan_callback_body(interp, cnames, cstmts, outside, own, binds)
+            var precise = result.0
+            mut [string] called = []
+            var ri = 0
+            while ri < result.1.length:
+                called.push(result.1[ri])
+                ri = ri + 1
+            for c in called:
+                if not local_ok.contains(c):
+                    precise = false
+            if not precise:
+                _ = call_method(interp, owner_v, "escalate", [])
+                return
+            # The binds reached through the own methods it calls (transitively) report too.
+            mut [string] used = []
+            var ui = 0
+            while ui < result.2.length:
+                used.push(result.2[ui])
+                ui = ui + 1
+            mut [string] seen = []
+            mut [string] todo = []
+            var ti = 0
+            while ti < called.length:
+                todo.push(called[ti])
+                ti = ti + 1
+            while todo.length > 0:
+                let string c = todo[todo.length - 1]
+                todo.remove(todo.length - 1)
+                if seen.contains(c):
+                    continue
+                seen.push(c)
+                var ci = 0
+                while ci < m_names.length:
+                    if m_names[ci] == c:
+                        for b in m_binds[ci]:
+                            if not used.contains(b):
+                                used.push(b)
+                        for c2 in m_calls[ci]:
+                            todo.push(c2)
+                    ci = ci + 1
+            _ = call_method(interp, owner_v, "touch", [])
+            for b in used.sorted():
+                var slot_owner = Value.Nil
+                if let slot_v = view_o.get_field(b):
+                    match slot_v:
+                        Value.Object(slot_o):
+                            if let so_f = slot_o.get_field("owner"):
+                                slot_owner = so_f
+                        _: nil
+                match slot_owner:
+                    Value.Nil: _ = call_method(interp, owner_v, "escalate", [])
+                    _: _ = call_method(interp, slot_owner, "touch", [])
+        _: nil
+
+# `newOwnedState(owner)`: the seeded state linked to its owner; a state handed to a child's `bind`
+# records its owner in its `Slot`, so the child's writes report to it.
+def Value link_state_owner(mut Interpreter interp, Value st, Value owner):
+    match st:
+        Value.Object(st_o):
+            st_o.set_field("__owner", owner)
+            var oid = Value.Nil
+            var ogen = Value.Nil
+            var osink = Value.Nil
+            match owner:
+                Value.Object(oo):
+                    if let v1 = oo.get_field("id"):
+                        oid = v1
+                    if let v2 = oo.get_field("generation"):
+                        ogen = v2
+                    if let v3 = oo.get_field("sink"):
+                        osink = v3
+                _: nil
+            for f in st_o.fields:
+                match f.1:
+                    Value.Object(slot_o):
+                        if slot_o.type_name == "Slot":
+                            if let owner_decl = interp.get_struct_decl("StateOwner"):
+                                let copy = instantiate_struct(interp, owner_decl, [Value.Labeled("id", oid), Value.Labeled("generation", ogen), Value.Labeled("sink", osink)])
+                                slot_o.set_field("owner", copy)
+                    _: nil
+        _: nil
+    st
+
 def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInner'actor inner, StructDecl decl, string method_name, [Value] args):
     if method_name == "viewKind":
         return Value.Str(decl.name)
@@ -983,14 +1271,22 @@ def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInn
                     Value.Nil: nil
                     Value.Array(_): nil
                     Value.Dict(_): nil
-                    Value.Object(_): nil
+                    Value.Object(po):
+                        # A bound value shows what its `Slot` holds.
+                        if po.type_name == "Slot":
+                            if let slot_val = po.get_field("value"):
+                                props.push((Value.Str(f.name), Value.Str(display_value(interp, slot_val))))
                     Value.Closure(_, _, _): nil
                     Value.Fn(_, _): nil
                     _: props.push((Value.Str(f.name), Value.Str(display_value(interp, fv))))
         return Value.Dict(props)
-    if method_name == "newState" or method_name == "newOwnedState":
-        return view_make_state(interp, inner, decl, false)
-    if method_name == "seededState":
+    if method_name == "newOwnedState":
+        let owned_st = view_make_state(interp, inner, decl, true)
+        if args.length > 0:
+            return link_state_owner(interp, owned_st, args[0])
+        return owned_st
+    # `newState()` is `seededState()`: the parent's seed per `state` field, else the initializer.
+    if method_name == "newState" or method_name == "seededState":
         return view_make_state(interp, inner, decl, true)
     if method_name == "viewHandles":
         var hact = ""
@@ -1045,6 +1341,17 @@ def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInn
             if let hv = inner.get_field(handler_field):
                 match hv:
                     Value.Nil: nil
+                    Value.Closure(_, _, hcap):
+                        # A callback built by a view body reports what it may change, then writes the
+                        # body's locals back into the mounted state (`__st`) once it has run.
+                        report_view_callback(interp, hv)
+                        _ = call_value(interp, hv, [])
+                        let prev_env = interp.current_env
+                        if let hc = hcap:
+                            interp.current_env = hc
+                            if let st_local = hc.get("__st"):
+                                view_sync(interp, st_local, false, 1)
+                        interp.current_env = prev_env
                     _: call_value(interp, hv, [])
             return Value.Void
         # Writes through a bound `value` slot: toggle / setBool / setText / setFloat.
@@ -1143,17 +1450,73 @@ def void mark_byvalue_param(mut Interpreter interp, Param param, Value bound):
             _: nil
 
 # The value to store when `e` is such a by-value parameter: a copy; anything else unchanged.
-def Value byvalue_store(mut Interpreter interp, Expr e, Value v):
+def Value byvalue_store(mut Interpreter interp, Expr e, Value v, Type? dest_ty):
     match e.kind:
         ExprKind.Var(vname):
             match v:
-                Value.Object(_):
-                    let flag = interp.current_env.get("__bv_{vname}")
-                    if let _ = flag:
+                Value.Object(vo):
+                    # An unqualified by-value parameter is always stored as a copy.
+                    let bv_flag = interp.current_env.get("__bv_{vname}")
+                    if let _ = bv_flag:
                         return clone_value(interp, v)
+                    # Otherwise the destination decides: a slot typed `T'actor`/`T'shared` stores
+                    # the handle itself.
+                    if let dt = dest_ty:
+                        if type_is_alias_handle(dt):
+                            return v
+                    if vo.type_name == "__Observed" or vname == "self":
+                        return v
+                    # A bare struct variable is stored as a copy, unless it is a `'actor`/`'shared`
+                    # handle (an alias, like `Rc::clone`) or an unqualified by-value parameter
+                    # marked `__bv_`; an `__alias_` marker is set by `mark_alias_binding`.
+                    let alias = interp.current_env.get("__alias_{vname}")
+                    if let _ = alias:
+                        return v
+                    return clone_value(interp, v)
                 _: nil
         _: nil
     v
+
+# The type stored into by `recv.push(..)`/`recv.set(..)`/`recv[k] = ..`: the element/value type.
+def Type? store_dest_type(mut Interpreter interp, Expr recv_expr):
+    guard let rty0 = static_type_of(interp, recv_expr) else: return nil
+    var rty = rty0
+    while true:
+        match rty:
+            Type.Qualified(qi, _): rty = qi
+            _: break
+    match rty:
+        Type.Array(elem): elem
+        Type.ArrayN(elem, _): elem
+        Type.Set(elem): elem
+        Type.Dict(_, dv): dv
+        _: nil
+
+# The declared type of the slot an assignment writes: a field of an object, a field of the
+# receiver, or an element of a typed collection.
+def Type? assign_dest_type(mut Interpreter interp, Expr target):
+    match target.kind:
+        ExprKind.Var(name): self_field_type(interp, name)
+        ExprKind.Field(_, _): static_type_of(interp, target)
+        ExprKind.Index(coll, _): store_dest_type(interp, coll)
+        _: nil
+
+# True for `T'actor`, `T'shared`, `T'guard` (through `?`): a handle whose copies alias.
+def bool type_is_alias_handle(Type ty):
+    match ty:
+        Type.Qualified(inner, qual):
+            match qual:
+                OwnerQual.Actor: true
+                OwnerQual.Shared: true
+                OwnerQual.Guard: true
+                _: type_is_alias_handle(inner)
+        Type.Optional(inner): type_is_alias_handle(inner)
+        _: false
+
+def void mark_alias_binding(mut Interpreter interp, string name, Type? ty):
+    if let t = ty:
+        if type_is_alias_handle(t):
+            env_define(interp, "__alias_{name}", Value.Bool(true), false)
 
 # ─── `'observed` ──────────────────────────────────────────────────────────────
 #
@@ -1469,7 +1832,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 "repeat":
                     let arg = args[0] else Value.Int(0)
                     match arg:
-                        Value.Int(n): Value.Str(s.repeat(n as uint))
+                        Value.Int(n): Value.Str(s.repeat((if n < 0: 0 else n) as uint))
                         _: throw "repeat: expected int argument"
                 "padLeft":
                     let width_val = args[0] else Value.Int(0)
@@ -1734,21 +2097,17 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         i = i + 1
                     acc
                 "sorted":
-                    let n = arr.length
-                    var sorted = arr
-                    var i = 0
-                    while i < n:
-                        var j = i + 1
-                        while j < n:
-                            let si = val_to_string(sorted[i])
-                            let sj = val_to_string(sorted[j])
-                            if string_gt(si, sj):
-                                let tmp = sorted[i]
-                                sorted[i] = sorted[j]
-                                sorted[j] = tmp
-                            j = j + 1
-                        i = i + 1
-                    Value.Array(sorted)
+                    mut srtd = arr
+                    var sd_a = 1
+                    while sd_a < srtd.length:
+                        var sd_b = sd_a
+                        while sd_b > 0 and value_lt(srtd[sd_b], srtd[sd_b - 1]):
+                            let sd_tmp = srtd[sd_b]
+                            srtd[sd_b] = srtd[sd_b - 1]
+                            srtd[sd_b - 1] = sd_tmp
+                            sd_b = sd_b - 1
+                        sd_a = sd_a + 1
+                    Value.Array(srtd)
                 "sortedBy":
                     let closure = args[0] else Value.Nil
                     mut keys = []
@@ -2608,6 +2967,24 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
 
         Value.Float64(f):
             match method_name:
+                "atan2":
+                    let a2 = args[0] else Value.Nil
+                    match a2:
+                        Value.Float64(y): Value.Float64(f.atan2(y))
+                        Value.Float32(y): Value.Float64(f.atan2(y as float64))
+                        _: throw "atan2: expected a float"
+                "log":
+                    let lb = args[0] else Value.Nil
+                    match lb:
+                        Value.Float64(b): Value.Float64(f.ln() / b.ln())
+                        Value.Float32(b): Value.Float64(f.ln() / (b as float64).ln())
+                        _: throw "log: expected a float base"
+                "clamp":
+                    let lo_v = args[0] else Value.Nil
+                    let hi_v = args[1] else Value.Nil
+                    guard let lo_f = value_as_float64_widened(lo_v) else: throw "clamp: expected floats"
+                    guard let hi_f = value_as_float64_widened(hi_v) else: throw "clamp: expected floats"
+                    Value.Float64(if f < lo_f: lo_f elif f > hi_f: hi_f else f)
                 "powi":
                     let pe = args[0] else Value.Int(0)
                     match pe:
@@ -2694,6 +3071,25 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
         # f32 precision throughout.
         Value.Float32(f):
             match method_name:
+                "atan2":
+                    let a2 = args[0] else Value.Nil
+                    match a2:
+                        Value.Float32(y): Value.Float32(f.atan2(y))
+                        Value.Float64(y): Value.Float32(f.atan2(y as float32))
+                        _: throw "atan2: expected a float"
+                "log":
+                    let lb = args[0] else Value.Nil
+                    match lb:
+                        Value.Float32(b): Value.Float32(f.ln() / b.ln())
+                        Value.Float64(b): Value.Float32(f.ln() / (b as float32).ln())
+                        _: throw "log: expected a float base"
+                "clamp":
+                    let lo_v = args[0] else Value.Nil
+                    let hi_v = args[1] else Value.Nil
+                    guard let lo_f = value_as_float64_widened(lo_v) else: throw "clamp: expected floats"
+                    guard let hi_f = value_as_float64_widened(hi_v) else: throw "clamp: expected floats"
+                    let cur_f = f as float64
+                    Value.Float32((if cur_f < lo_f: lo_f elif cur_f > hi_f: hi_f else cur_f) as float32)
                 "powi":
                     let pe = args[0] else Value.Int(0)
                     match pe:

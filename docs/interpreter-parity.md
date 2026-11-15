@@ -1,220 +1,110 @@
-# Parité du transpileur et des interpréteurs
+# Parity of the transpiler and the interpreters
 
-Audit du 29 septembre 2026, après le premier lot de corrections numériques.
+`boring` has two ways to run a program: the transpiler (`boring build`, the functional reference)
+and a tree-walk interpreter (`boring run`). This project adds a third, an interpreter written in
+Boring itself. This document says what is measured, how, what the architecture looks like, and
+which gaps remain. Last update: 2026-11-15.
 
-## Résultat et périmètre
+## What is measured
 
-Le transpileur sert de référence fonctionnelle. Les deux interpréteurs sont déjà
-substantiels, mais leurs suites historiques ne couvrent pas les mêmes programmes.
-Le self-hosted interpreter est un portage complet de son périmètre d'origine, pas
-une garantie de parité avec toutes les fonctionnalités actuelles du transpileur.
+`tools/interpreter_parity.py` runs each program with its real path and compares stdout with the
+`.expected` file the transpiler suite uses. Two corpora, both read from the `boring` checkout:
 
-La comparaison automatique sélectionne les **167 fixtures simples** enregistrées
-par `transpile_test!` dans `tests/transpile.rs` et disposant de fichiers `.br` et
-`.expected`. Chaque programme est lancé avec son chemin réel, et stdout est comparé
-à la même sortie attendue que dans la suite du transpileur.
+| corpus | selection | rust (`boring run`) | this interpreter |
+|---|---|---:|---:|
+| registered | the 379 simple `transpile_test!` fixtures of `tests/transpile.rs` that have `.br` + `.expected` | 378 ok | 379 ok |
+| unregistered (`--unregistered`) | the 86 other `tests/cases/*.br` with an `.expected` file | 86 ok | 84 ok, 2 timeout |
 
-| Résultat | Interpréteur Rust | Interpréteur Boring strict/multi |
-|---|---:|---:|
-| Sortie conforme | 157 | 112 |
-| Erreur ou arrêt anormal | 9 | 38 |
-| Sortie différente | 1 | 4 |
-| Délai de 4 secondes dépassé | 0 | 13 |
+The numbers measure these corpora, not a percentage of the language. A timeout is a case to
+diagnose, not proof of an infinite loop. Project tests, negative tests, GPU targets and calls to
+external Rust libraries are not covered by this selection. The generated Rust is compiled and run
+only with `--transpile`; otherwise the `.expected` file is the oracle.
 
-**Ces nombres mesurent ce corpus, pas un pourcentage de fonctionnalités du langage.**
-Un dépassement de délai est un cas à diagnostiquer, pas une preuve de boucle infinie.
-Le corpus complet n'a pas été recompilé pendant cet audit : les sorties `.expected`
-constituent son oracle. Le Rust généré a été réellement compilé/exécuté pour les
-cas numériques modifiés (voir validation ci-dessous). Les programmes projet, les
-cas négatifs, les cibles GPU et les appels à des bibliothèques Rust externes ne
-sont pas couverts exhaustivement par cette sélection.
+The JSON written by `--output` records the `boring` commit under test (`+dirty` when its tree has
+local changes), because the result depends on it.
 
-## Architecture du self-hosted interpreter
+## Architecture
 
-L'interpréteur écrit en Boring, dans `interpreter/`, forme une chaîne
-autonome : lexer, parseur et moteur d'évaluation sont tous implémentés en Boring.
-Il ne dépend pas du front-end Rust pour analyser le programme interprété. Le
-checker, le transpileur et les backends GPU restent en Rust et ne font pas partie
-de ce portage.
+The interpreter in `interpreter/` is a chain written entirely in Boring: lexer, parser and
+evaluator. It does not use the Rust front end to parse the guest program. The checker, the
+transpiler and the GPU back ends stay in Rust.
 
-Le même code peut être transpilé en deux variantes : strict/multi utilise les
-représentations thread-safe du transpileur, tandis que strict/single utilise les
-formes locales `Rc`/`RefCell`. Cette double construction vérifie que le code de
-l'interpréteur respecte les deux modèles ; elle ne prouve pas que leurs moteurs
-d'exécution ont la même couverture fonctionnelle que le transpileur.
+The same sources are transpiled four times (strict or managed memory, multi or single thread), so
+the interpreter also checks that the transpiler's output is right in all four models. That does not
+prove that the four engines cover the same language as the transpiler.
 
-Quelques choix d'implémentation restent volontairement plus simples que ceux du
-Rust généré :
+Choices that stay simpler than the generated Rust:
 
-- `Value::Dict` et `Value::Set` reposent sur des tableaux et effectuent des
-  recherches linéaires. Les opérations élémentaires sont donc O(n), et les
-  opérations d'ensemble qui recherchent chaque élément peuvent être O(n·m), là
-  où le Rust généré utilise `HashMap`/`HashSet`. Une vraie table de hachage
-  demanderait notamment un contrat `Hash`/`Eq` pour toutes les variantes
-  récursives et dynamiques de `Value` ;
-- les canaux utilisent un tableau avec suppression en tête plutôt qu'un
-  `VecDeque`, donc cette opération est O(n) ;
-- les imports de fichiers relatifs sont pris en charge, mais la stdlib embarquée
-  `boring.*`, les dépendances `[deps]`, `BORING_PATH` et l'isolation complète des
-  imports sélectifs ne le sont pas. Ces limites figurent également dans le tableau
-  des écarts ci-dessous.
+- `Value.Dict` and `Value.Set` are arrays with linear search (O(n)); set operations that look up
+  each element can be O(n·m). A hash table would need a `Hash`/`Eq` contract for every recursive
+  and dynamic `Value`.
+- Channels are arrays with removal at the head (O(n)), not a `VecDeque`.
+- Relative file imports work; `[deps]` and `BORING_PATH` do not, and `use boring.<module>` is
+  resolved against the `stdlib/` of the directory the interpreter runs from.
 
-Avant correction, sur les 166 fixtures alors sélectionnées : Rust 154 conformes,
-Boring 108 conformes. Le nouveau cas numérique ajoute une réussite aux deux moteurs ;
-les corrections rétablissent deux anciens cas Rust et trois anciens cas Boring.
-`ord_chr`, également corrigé côté Boring, appartient à la suite fonctionnelle mais
-n'est pas enregistré comme fixture simple dans la suite du transpileur.
+### Mechanisms worth knowing
 
-## Écarts à implémenter
+- **Sockets.** `TcpListener` and `TcpStream` are not `Clone`, so they cannot sit in `Interpreter`'s
+  state (it is copied through its actor handle). They live in a `Sockets` struct behind an actor,
+  keyed by an `id`; the guest object only carries that `id`. `read`/`read_exact` refill the
+  caller's buffer in place. This needs the `boring` fix `fa9fdb9f` (non-`Clone` external types in
+  collections). I/O errors only say which call failed: `try?` drops the message.
+- **Reflection.** `introspect()` returns `Field`/`Method` objects; values go through the built-in
+  `FieldValue` enum (`Int`, `Float`, `Bool`, `Str`, `Other`, ...), registered at start-up.
+  `Method.call` works on type-level methods; `type let`, `type var` and `type set` are parsed, kept
+  in `type_var_store` (key `Owner::name`) and written through their setter, which cannot re-enter
+  itself.
+- **`{x:?}` of an optional.** Optionals are transparent at run time (the value or `nil`), so
+  `Some(v)`/`None` comes from the static type of the hole: a declared `let` type, a struct field,
+  an element of a typed collection, a built-in optional call (`first`, `last`, `find`, `indexOf`,
+  `parseInt`, ...), or a function's return type. Declared types are remembered per call depth and
+  name (`declared_types`), only for this purpose.
+- **By-value structs and `'observed`.** An unqualified, non-`mut` struct parameter is stored by
+  copy; `'observed` values live in an `__Observed` wrapper that notifies subscribers.
+- **`view`.** `boring` lowers views in Rust; the interpreter emulates the runtime methods
+  (`viewKind`, `expand`, modifiers, `env`/`state`) natively in `methods.br`.
+- **A parser pitfall of this codebase.** Reading two fields of `interp` (an actor handle) in one
+  expression locks it twice and deadlocks; read each into its own `let` first.
 
-| Domaine | Interpréteur Rust | Interpréteur Boring | Travail restant / reproduction |
-|---|---|---|---|
-| Puissances numériques | Corrigé : `.pow` entier manquait | Corrigé : `.pow` entier et `.pow`/`.powf` flottants manquaient | Cas `pow_method_*`, `numeric_method_parity` |
-| `ord` / `chr` | Déjà exécutables | Corrigé : noms enregistrés sans branche dans `call_native` | Unicode BMP et hors BMP dans `numeric_method_parity` |
-| `'atomic` | Lecture/affectation ordinaires possibles, mais `.swap` absent sur le scalaire | Qualificateur absent de `OwnerQual`, syntaxe refusée ; `.swap` absent | `atomic_explicit_ops`, `atomic_promotion_binding_permission_regression` ; préserver aussi partage, droits de mutation et valeur précédente |
-| `'observed` | Pas de comportement de souscription sur les objets | AST/parseur sans suffixe correspondant ; runtime absent | `observed_qualifier` : callbacks, désinscription et portée des subscriptions |
-| Qualificateurs, injection et valeurs partagées | `singleton_di` et retours actor/guard rejetés à la mutation ; `inject_di` et `static_di` passent | Syntaxe des attributs/suffixes manquante ; certains programmes dépassent le délai | `singleton_di`, `actor_guard_shared_return_qualifier`, `shared_return_callsite_no_double_wrap` ; audit du transport des permissions et de l'identité des objets |
-| Syntaxe récente et désucrage | Front-end partagé avec le transpileur : `desugar_labeled_array`, `desugar_array_block`, `desugar_inject` | Parseur indépendant, sans équivalent complet des passes récentes | `array_block_*_transpile`, `try_prefix_in_cond_clause_noparen`, `inline_if_else_next_line_postfix`, `qualifier_group_param` |
-| Méthodes de type et génériques | La plupart des cas passent ; `monomorphize_mut_arg` perd une permission de mutation | Plusieurs erreurs de parsing/binding ou dépassements du délai | `enum_type_def*`, `type_def_typed_throws`, `monomorphize_*` ; ne pas confondre effacement des types et absence de substitution/binding |
-| Dictionnaires et optionnels | Cas concernés conformes | Lecture d'une clé absente jette au lieu de fournir l'optionnel attendu ; différences avec `else` | `dict_index_optional_return`, `if_let_dict_index_no_else`, `dict_string_key_index` |
-| Coercitions numériques | Cas concernés conformes | Rétrécissement, débordement/cast et propagation float32 incomplets ; `atan2` absent | `narrowing_cast_if_let`, `int_literal_overflow_cast`, `if_else_cast_numeric`, `float32_struct_method_math` |
-| Erreurs natives | `Error` présent | `Error` non enregistré | `builtin_error_enum`, `typed_catch_match_error` ; ajouter les variantes et la propagation typée |
-| JSON et attributs serde | Implémentation dédiée dans `src/interpreter/json.rs` ; fixtures conformes | Pas de dispatch `json`/`fromJson` équivalent ; les fixtures s'arrêtent déjà sur `@` | `json_serde_shapes`, `json_serde_rename`, `json_untagged_enum` ; parser les attributs puis porter la matérialisation typée |
-| Introspection | Implémentée, mais une représentation affichée diffère de l'oracle | `.introspect()` absent | `introspect_thread_safety` : Rust affiche `1.5` / `"origin"` là où l'oracle attend `Float(1.5)` / `Str("origin")` ; vérifier le contrat avant correction |
-| Imports et dépendances | Sources Boring, stdlib embarquée et dépendances résolues par le front-end | Imports de fichiers présents ; `boring.*` explicitement refusé, pas de résolution `[deps]` équivalente | `boring_stdlib_collections` ; `stdlib.br::exec_use` publie aussi tous les symboles globalement, même pour un import sélectif |
-| Interop Rust | Émulation limitée : `mem.swap/replace/take`, `Box.pointee`, `Duration.as_secs` manquent dans ces cas | Pas d'équivalent général à `Value::RustType` | `mem_borrow_builtins`, `pointee`, `const_promotion_known_fn` ; définir une liste explicite d'opérations émulées |
-| Macros | `env!` et `include_str!` rendent une chaîne vide ; macro inconnue renvoie le dernier argument ou Void | Plusieurs macros ne sont pas dispatchées ; fallback Nil | Inspection de `src/interpreter/call.rs::call_macro` et `eval.br::eval_expr` ; définir la sémantique de runtime des macros de compilation et rejeter les autres explicitement |
-| Concurrence | Futures exécutées synchroniquement, annulation non opérationnelle, délais partiellement simulés | Tâches synchrones et délai ignoré | Inspection `eval_expr.rs`, `methods.rs`, `eval.br` ; les sorties de petites fixtures de tâches ne prouvent pas une concurrence réelle |
-| GPU | Simulateur CPU avec tests dédiés | Émulation propre, non comparée exhaustivement ici | Conserver la distinction entre équivalence fonctionnelle simulée et exécution GPU réelle ; utiliser les suites GPU séparées |
+## Known gaps (unregistered corpus)
 
-Les listes de manques ci-dessus reposent soit sur les fixtures en échec, soit sur
-les branches explicites du code indiquées. Une ligne « inspection » n'a pas été
-validée par une comparaison dynamique exhaustive.
+Both fixtures below pass with `boring run`; 84 of the 86 unregistered ones pass with this interpreter.
 
-## Ordre proposé
+| case | what is missing |
+|---|---|
+| `kernel_aux_method_return_type_first`, `kernel_sim_many_threads_big_field` | Performance, not semantics: each builds a 30 000-element array with `for i in 0..<30000: b.push(..)`. Here `push` copies the whole array (the environment holds values, not references), so the loop alone costs about 450 million value copies, minutes in a debug build. The kernel part (see below) is not the cost: a 256-thread launch with an empty body is as slow. Fixing it needs an in-place `push`, which the environment's by-value storage does not allow without redesign |
 
-1. **Sécuriser le parseur Boring** : diagnostiquer les 13 dépassements de délai,
-   puis aligner méthodes de type, attributs, suffixes et syntaxe des blocs.
-2. **Aligner les comportements usuels** : dictionnaires optionnels, coercitions,
-   fonctions mathématiques, `Error`, résolution des paramètres génériques et noms
-   de méthodes (voir `builtin_name_user_members`). Ajouter chaque fixture réparée
-   à `tests/run.rs` de `boring` et/ou `tests/interpreter_functional.rs` (de ce projet).
-3. **Aligner les permissions et le partage** : `mut`, retours qualifiés,
-   `'atomic`, puis `'observed`. Tester les alias et les mutations visibles par
-   plusieurs références, pas seulement les valeurs finales d'une variable locale.
-4. **Porter les services du front-end/runtime Rust** vers Boring : désucrages,
-   imports stdlib/dépendances, JSON, introspection. Garder le transpileur inchangé
-   sauf si une comparaison met en évidence un défaut de la référence.
-5. **Décider du contrat d'exécution** : concurrence/délais réels ou simulation
-   explicitement documentée, et périmètre de l'interop Rust/GPU. Ces sujets
-   demandent des tests observant l'ordonnancement, pas uniquement stdout.
+The 21 gaps closed since the first audit, by family:
 
-## Premier lot réalisé
+- **Parsing**: `Fn(args)` closure types, `{{` before `$"..."`, `[..<n]` / `[..=n]` allocation, a function-typed parameter keeps a function type.
+- **Storage by value**: a bare struct variable stored into a dict, field, constructor argument or collection is copied unless the destination slot is typed `'actor`/`'shared` or the binding is; a by-value parameter is always copied; `.clone()` of a `'actor` binding aliases.
+- **Numeric coercion**: a write to a field of the receiver takes the field's numeric type; a setter body writes its field instead of re-entering the setter.
+- **Array blocks**: a function with a trailing array or closure parameter, implicit `Identifiable` keys, static `Sited` site numbering.
+- **Views**: seeded `newState()`, the parser knows `boring.ui`'s `bind` fields, a state handed to a child's `bind` passes its `Slot`, callbacks write back into the mounted state and report `touch`/`escalate` to their owner's `DirtySink`.
+- **Kernels**: `kernel K:` runs thread by thread (`k(block = .., grid = ..)`, `.thread`/`.block`/`.grid`, top-level `sync` splits the body into phases a whole block finishes in turn). A kernel array that is never written is kept in 256-element chunks.
 
-- `.pow` sur les douze variantes entières dans les deux interpréteurs : résultat
-  de même largeur, calcul entier exact, exposant converti en `uint32` comme dans
-  le transpileur. Les dépassements sont signalés par les interpréteurs via
-  `checked_pow`, sans arrondi en flottant. Cela ne promet pas de reproduire le
-  wrapping d'un binaire Rust compilé sans vérification de débordement.
-- `.pow` et `.powf` sur float32/float64 dans l'interpréteur Boring, en conservant
-  la largeur du récepteur.
-- `ord` et `chr` dans son dispatch natif, avec vérification des entrées avant
-  appel aux primitives du langage.
-- Réutilisation des cas existants et ajout de `numeric_method_parity`, incluant
-  les douze largeurs, zéro, base négative, exposant typé, entier supérieur à 2⁵³,
-  méthode utilisateur homonyme, caractères accentués et emoji.
-- Test unitaire Rust de conservation de variante, débordement et arguments invalides.
+## Reproduce
 
-Validation : 845 tests unitaires, 195 tests de programmes, 4 constructions de
-l'interpréteur Boring et 88 tests fonctionnels (chaque cas sur les 4 variantes).
-Les 3 cas `pow_method_*` passent leurs 12 tests de transpilation/exécution.
-Le nouveau cas `numeric_method_parity` passe aussi les 4 configurations du transpileur.
-Le nouvel outil compare également les 4 cas numériques aux 4 interpréteurs Boring,
-à l'interpréteur Rust et à un exécutable Rust nouvellement généré en strict/multi.
+This project depends on `boring` (`../boring`, or `BORING_DIR`), never the reverse.
 
-## Reproduire et suivre la progression
+```sh
+tools/check.sh              # build boring, build the interpreter, parity (both corpora), the 3 suites
+```
 
-Ce projet dépend du dépôt `boring` (`../boring`, ou `BORING_DIR`), jamais l'inverse.
+or step by step:
 
 ```sh
 (cd ../boring && cargo build --release)
-cargo test --test interpreter_build
-python3 tools/interpreter_parity.py --timeout 4 --output /tmp/parity.json
-# Les écarts connus entraînent volontairement un code de sortie 1.
-
-# Comparaison ciblée, incluant une vraie compilation de la référence :
-python3 tools/interpreter_parity.py --all-modes --transpile numeric_method_parity pow_method_int_unaffected pow_method_int_exponent_var pow_method_float_width
-
+(cd interpreter && ../../boring/target/release/boring build \
+   && cargo build --manifest-path main_rust/Cargo.toml)
+python3 tools/interpreter_parity.py --timeout 6 --output /tmp/parity.json
+python3 tools/interpreter_parity.py --unregistered --timeout 6 --output /tmp/parity-unregistered.json
+cargo test --test interpreter
+cargo test --test interpreter_build -- --test-threads=1
 cargo test --test interpreter_functional
-# Côté boring : (cd ../boring && cargo test --bin boring --test run --test transpile pow_method)
 ```
 
-`--transpile` vérifie strict/multi ; la suite Rust `tests/transpile.rs` reste la
-référence pour la matrice complète mode/threading. L'outil produit les diagnostics
-et sorties divergentes dans le JSON, sans maintenir une liste d'exclusions qui
-ferait artificiellement disparaître les manques. Le délai peut être augmenté
-pour distinguer lenteur et blocage sur une autre machine.
-
-## Inventaire des écarts observés après corrections
-
-« erreur » inclut les erreurs propres et les panics de l'hôte ; consulter le JSON
-pour les distinguer. « délai » signifie seulement que 4 secondes ont été dépassées.
-Les 112 cas conformes sur les deux moteurs sont omis de cette table.
-
-| Fixture dans `tests/cases/` | Rust | Boring strict/multi |
-|---|---|---|
-| `trait_type_level_methods` | conforme | délai |
-| `array_block_flat_transpile` | conforme | erreur |
-| `array_block_for_transpile` | conforme | erreur |
-| `boring_stdlib_collections` | conforme | erreur |
-| `int_literal_overflow_cast` | conforme | sortie différente |
-| `builtin_error_enum` | conforme | erreur |
-| `typed_catch_match_error` | conforme | erreur |
-| `type_def_typed_throws` | conforme | délai |
-| `type_method_throws_untyped` | conforme | délai |
-| `untyped_string_lit_local_to_type_method` | conforme | délai |
-| `enum_type_def` | conforme | erreur |
-| `enum_type_def_throws` | conforme | erreur |
-| `float32_struct_method_math` | conforme | erreur |
-| `pointee` | erreur | erreur |
-| `pub_top_level_const` | conforme | erreur |
-| `const_promotion_known_fn` | erreur | erreur |
-| `dict_index_optional_return` | conforme | erreur |
-| `if_let_dict_index_no_else` | conforme | erreur |
-| `dict_string_key_index` | conforme | sortie différente |
-| `builtin_name_user_members` | conforme | sortie différente |
-| `implicit_self_length_nontail` | conforme | délai |
-| `throws_method_name_collision` | conforme | délai |
-| `narrowing_cast_if_let` | conforme | sortie différente |
-| `try_prefix_in_cond_clause_noparen` | conforme | erreur |
-| `option_owned_methods` | conforme | délai |
-| `cast_bare_field_index` | conforme | délai |
-| `if_else_cast_numeric` | conforme | erreur |
-| `mem_borrow_builtins` | erreur | erreur |
-| `json_serde_rename` | conforme | erreur |
-| `try_wrap_double_handling` | conforme | erreur |
-| `json_untagged_enum` | conforme | erreur |
-| `json_serde_shapes` | conforme | erreur |
-| `enum_derive_no_debug` | conforme | erreur |
-| `self_field_loop_match_borrow` | conforme | délai |
-| `introspect_thread_safety` | sortie différente | erreur |
-| `qualifier_group_param` | conforme | erreur |
-| `enum_variant_shadow` | conforme | erreur |
-| `monomorphize_struct` | conforme | délai |
-| `monomorphize_mut_arg` | erreur | erreur |
-| `monomorphize_cross_file_main` | conforme | délai |
-| `monomorphize_method` | conforme | erreur |
-| `monomorphize_method_on_generic_struct` | conforme | erreur |
-| `monomorphize_optional_method` | conforme | erreur |
-| `monomorphize_ext_method` | conforme | erreur |
-| `monomorphize_enum_method` | conforme | erreur |
-| `guard_let_else_panic_throws` | conforme | erreur |
-| `atomic_explicit_ops` | erreur | erreur |
-| `atomic_promotion_binding_permission_regression` | erreur | erreur |
-| `observed_qualifier` | erreur | erreur |
-| `singleton_di` | erreur | erreur |
-| `inject_di` | conforme | délai |
-| `static_di` | conforme | délai |
-| `actor_guard_shared_return_qualifier` | erreur | erreur |
-| `shared_return_callsite_no_double_wrap` | conforme | erreur |
-| `inline_if_else_next_line_postfix` | conforme | erreur |
+Add `--transpile` to also compile and run the generated Rust of each selected case (strict + multi),
+`--all-modes` to check the four binaries. The tool exits with code 1 while any case differs; it
+keeps no exclusion list, so a gap never disappears from the report. Raise `--timeout` to tell
+slowness from a hang.
