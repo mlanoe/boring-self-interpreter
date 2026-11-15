@@ -46,6 +46,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
         # Macro calls: format!, vec!, etc.
         ExprKind.MacroCall(macro_name, macro_args):
             let evaled_args = macro_args.map((a): eval_expr(interp, a))
+            if interp.has_pending_throw:
+                return Value.Nil
             if macro_name == "vec":
                 Value.Array(evaled_args)
             elif macro_name == "format" or macro_name == "println" or macro_name == "print":
@@ -331,6 +333,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     let gen_callee = eval_expr(interp, callee_expr2)
                     let gen_hints = call_hint_types(interp, gen_callee, gen_args.length)
                     let gen_arg_vals = eval_args_with_hints(interp, gen_args, gen_hints)
+                    if interp.has_pending_throw:
+                        return Value.Nil
                     interp.last_var_params = []
                     let gen_result = call_value(interp, gen_callee, gen_arg_vals)
                     write_back_fn_var_args(interp, gen_callee, gen_args)
@@ -339,6 +343,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     let gen_callee = eval_expr(interp, callee_expr2)
                     let gen_hints = call_hint_types(interp, gen_callee, gen_args.length)
                     let gen_arg_vals = eval_args_with_hints(interp, gen_args, gen_hints)
+                    if interp.has_pending_throw:
+                        return Value.Nil
                     interp.last_var_params = []
                     let gen_result = call_value(interp, gen_callee, gen_arg_vals)
                     write_back_fn_var_args(interp, gen_callee, gen_args)
@@ -355,6 +361,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                 let all_hints = fn_decl.params.map((p): p.ty)
                 let extra_hints = if all_hints.length > 0: all_hints.slice(1, all_hints.length) else []
                 let extra_args = eval_args_with_hints(interp, args, extra_hints)
+                if interp.has_pending_throw:
+                    return Value.Nil
                 mut all_args = [obj]
                 for a in extra_args:
                     all_args.push(a)
@@ -362,6 +370,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             else:
                 let hints = method_hint_types(interp, obj, method, args.length)
                 let extra_args = eval_args_with_hints(interp, args, hints)
+                if interp.has_pending_throw:
+                    return Value.Nil
                 call_method(interp, obj, method, extra_args)
 
         # Method call
@@ -444,6 +454,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             check_mutating_method_call(interp, recv_expr, recv, method)
             let hints = method_hint_types(interp, recv, method, args.length)
             var mut arg_vals = eval_args_with_hints(interp, args, hints)
+            if interp.has_pending_throw:
+                return Value.Nil
             # Storing a by-value struct parameter into a collection stores a copy.
             if method == "push" or method == "add" or method == "append" or method == "insert" or method == "set" or method == "put":
                 var ai = 0
@@ -583,11 +595,15 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         ExprKind.OptionalMethodCall(recv_expr, method, args):
             let recv = eval_expr(interp, recv_expr)
+            if interp.has_pending_throw:
+                return Value.Nil
             match recv:
                 Value.Nil: Value.Nil
                 _:
                     let hints = method_hint_types(interp, recv, method, args.length)
                     let arg_vals = eval_args_with_hints(interp, args, hints)
+                    if interp.has_pending_throw:
+                        return Value.Nil
                     call_method(interp, recv, method, arg_vals)
 
         # Index access
@@ -684,6 +700,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut vals = []
             for item in elems:
                 vals.push(eval_expr(interp, item))
+                if interp.has_pending_throw:
+                    return Value.Nil
             # Untyped numeric literals adopt the width of a typed float32
             # element (`[a, 2.0, 0.5]` with `float32 a`), same rule as binary
             # operators (`coerce_float_literal_pair`). float16 likewise.
@@ -813,6 +831,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut vals = []
             for item in elems:
                 vals.push(eval_expr(interp, item))
+                if interp.has_pending_throw:
+                    return Value.Nil
             Value.Tuple(vals)
 
         # Do block (inline block expression)
@@ -839,11 +859,15 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut [Expr] dexprs = []
             for pair in pairs:
                 dvals.push(eval_expr(interp, pair.1))
+                if interp.has_pending_throw:
+                    return Value.Nil
                 dexprs.push(pair.1)
             let dvals_adopted = adopt_literal_float_width(dvals, dexprs)
             var di = 0
             for pair in pairs:
                 let k = eval_expr(interp, pair.0)
+                if interp.has_pending_throw:
+                    return Value.Nil
                 entries.push((k, dvals_adopted[di]))
                 di = di + 1
             Value.Dict(entries)
@@ -853,6 +877,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut vals = []
             for item in elems:
                 let v = eval_expr(interp, item)
+                if interp.has_pending_throw:
+                    return Value.Nil
                 if not value_list_contains(vals, v):
                     vals.push(v)
             Value.Set(vals)
@@ -866,9 +892,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         result = result + text
                     StringSegment.Expr(e):
                         let v = eval_expr(interp, e)
+                        if interp.has_pending_throw:
+                            return Value.Nil
                         result = result + display_value(interp, v)
                     StringSegment.FormattedExpr(e, fmt_spec):
                         let v = eval_expr(interp, e)
+                        if interp.has_pending_throw:
+                            return Value.Nil
                         var typed_done = false
                         if fmt_spec.endsWith("?"):
                             if let sty = static_type_of(interp, e):
@@ -960,7 +990,10 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         ExprKind.Assign(target, val_expr):
             let val0 = eval_expr(interp, val_expr)
-            let val = byvalue_store(interp, val_expr, val0, assign_dest_type(interp, target))
+            # A throwing right-hand side must not overwrite the target with Nil.
+            if interp.has_pending_throw:
+                return Value.Nil
+            let val = byvalue_store(interp, val_expr, val0)
             # `g = f` / `p.v = f` where the slot holds a fixed-point value: only an
             # untyped literal may adopt its format.
             match val:
@@ -1118,8 +1151,12 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     BreakSignal(v):
                         break_val = v
                         break
-                    ReturnSignal(v): return v
-                    ThrowSignal(v): return v
+                    ReturnSignal(v):
+                        interp.set_pending_return(v)
+                        return Value.Nil
+                    ThrowSignal(v):
+                        interp.set_pending_throw(v)
+                        return Value.Nil
                     _: nil
             break_val
 
@@ -1263,6 +1300,8 @@ def [Value] eval_args_with_hints(mut Interpreter interp, [Arg] args, [Type?] hin
                     _: nil
         if not hinted:
             v = eval_expr(interp, arg.value)
+        if interp.has_pending_throw:
+            return vals
         if i < hints.length and not arg.spread and arg.label == nil:
             if let strict_ty = hints[i]:
                 check_fixed_declared(strict_ty, arg.value, v, "pass", "argument {i + 1}")
@@ -1389,11 +1428,16 @@ def Value eval_binop(mut Interpreter interp, BinOp op, Expr lhs, Expr rhs):
     match op:
         BinOp.And:
             let l = eval_expr(interp, lhs)
+            # A throwing operand leaves a pending throw: stop here rather than evaluating on Nil.
+            if interp.has_pending_throw:
+                return Value.Nil
             match l:
                 Value.Bool(false):
                     Value.Bool(false)
                 Value.Bool(true):
                     let r = eval_expr(interp, rhs)
+                    if interp.has_pending_throw:
+                        return Value.Nil
                     match r:
                         Value.Bool(b):
                             Value.Bool(b)
@@ -1403,11 +1447,15 @@ def Value eval_binop(mut Interpreter interp, BinOp op, Expr lhs, Expr rhs):
                     throw "left side of 'and' must be bool"
         BinOp.Or:
             let l = eval_expr(interp, lhs)
+            if interp.has_pending_throw:
+                return Value.Nil
             match l:
                 Value.Bool(true):
                     Value.Bool(true)
                 Value.Bool(false):
                     let r = eval_expr(interp, rhs)
+                    if interp.has_pending_throw:
+                        return Value.Nil
                     match r:
                         Value.Bool(b):
                             Value.Bool(b)
@@ -1417,7 +1465,11 @@ def Value eval_binop(mut Interpreter interp, BinOp op, Expr lhs, Expr rhs):
                     throw "left side of 'or' must be bool"
         _:
             var l = eval_expr(interp, lhs)
+            if interp.has_pending_throw:
+                return Value.Nil
             var r = eval_expr(interp, rhs)
+            if interp.has_pending_throw:
+                return Value.Nil
             let coerced = coerce_float_literal_pair(l, r, lhs, rhs)
             l = coerced.0
             r = coerced.1
@@ -2741,7 +2793,7 @@ def Value? try_call_conversion_method(mut Interpreter interp, Value val, string 
                         env_define(interp, "self", Value.Object(inner.clone()), false)
                         for field in inner.fields:
                             env_define(interp, field.0, field.1, false)
-                        let result = eval_block(interp, m.body)
+                        let result = eval_body_block(interp, m.body)
                         pop_scope(interp)
                         return result
                     mi = mi + 1
@@ -3008,7 +3060,7 @@ def Value cast_value(mut Interpreter interp, Value val0, Type ty):
                                 env_define(interp, "self", Value.Object(inner), false)
                                 for field in inner.fields:
                                     env_define(interp, field.0, field.1, false)
-                                conv_result = eval_block(interp, conv.body)
+                                conv_result = eval_body_block(interp, conv.body)
                                 pop_scope(interp)
                                 found_conv = true
                                 break
@@ -3039,7 +3091,7 @@ def Value cast_value(mut Interpreter interp, Value val0, Type ty):
                                 efound_conv = true
                                 let echild_env = push_scope(interp)
                                 env_define(interp, "self", self_enum_val, false)
-                                econv_result = eval_block(interp, econv.body)
+                                econv_result = eval_body_block(interp, econv.body)
                                 pop_scope(interp)
                             eci = eci + 1
                     if efound_conv:
@@ -3648,6 +3700,20 @@ def Value task_obj_get_value(Value v):
         _: v
 
 # Evaluate a block of statements, returning the last expression value
+# Evaluates a block that is a whole function-like body (computed property, conversion, setter,
+# init): a `return` there ends that body and yields its value, instead of escaping as a pending
+# return into the caller. A pending throw is left in place for the caller to pick up.
+def Value eval_body_block(mut Interpreter interp, [Stmt] stmts):
+    let v = eval_block(interp, stmts)
+    if interp.has_pending_throw:
+        return Value.Nil
+    if interp.has_pending_return:
+        let rv = interp.pending_return_val
+        interp.has_pending_return = false
+        interp.pending_return_val = Value.Nil
+        return rv
+    v
+
 def Value eval_block(mut Interpreter interp, [Stmt] stmts):
     var last = Value.Nil
     var i = 0
@@ -3671,17 +3737,31 @@ def Value eval_block(mut Interpreter interp, [Stmt] stmts):
     last
 
 # Evaluate the last statement as an expression (for implicit return)
+# Turns a `return`/`throw` signal raised while evaluating a statement as an expression into a
+# pending return/throw, which the enclosing statement or call picks up. Other signals are dropped.
+def void signal_to_pending(mut Interpreter interp, Signal? sig):
+    match sig:
+        ReturnSignal(rv): interp.set_pending_return(rv)
+        ThrowSignal(tv): interp.set_pending_throw(tv)
+        _: nil
+
 def Value eval_stmt_as_expr(mut Interpreter interp, Stmt stmt):
     match stmt:
         Stmt.Expr(e):
             eval_expr(interp, e)
         Stmt.Return(ret_stmt):
+            # A `return` in tail position of an arm/branch block returns from the enclosing
+            # function, it does not merely yield a value.
             if let e = ret_stmt.value:
-                eval_expr(interp, e)
+                let rv = eval_expr(interp, e)
+                if not interp.has_pending_throw:
+                    interp.set_pending_return(rv)
             else:
-                Value.Nil
+                interp.set_pending_return(Value.Nil)
+            Value.Nil
         Stmt.If(s):
-            exec_stmt(interp, Stmt.If(s))
+            let sig = exec_stmt(interp, Stmt.If(s))
+            signal_to_pending(interp, sig)
             Value.Nil
         Stmt.Match(s):
             let subject = eval_expr(interp, s.subject)
@@ -3691,9 +3771,13 @@ def Value eval_stmt_as_expr(mut Interpreter interp, Stmt stmt):
             match sig:
                 ReturnSignal(value): value
                 YieldSignal(value, _): value
+                ThrowSignal(tv):
+                    interp.set_pending_throw(tv)
+                    Value.Nil
                 _: Value.Nil
         _:
-            exec_stmt(interp, stmt)
+            let sig = exec_stmt(interp, stmt)
+            signal_to_pending(interp, sig)
             Value.Nil
 
 # Untyped numeric literals in a literal adopt the width of a typed float16/float32 value of the
@@ -4082,10 +4166,8 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                             if s.name == field_name:
                                 let child_env = push_scope(interp)
                                 env_define(interp, "self", Value.Object(inner), true)
-                                env_define(interp, s.param_name, cval, true)
-                                interp.in_setter = true
-                                _ = eval_block(interp, s.body)
-                                interp.in_setter = false
+                                env_define(interp, s.param_name, val, true)
+                                _ = eval_body_block(interp, s.body)
                                 pop_scope(interp)
                                 setter_called = true
                                 break
@@ -4262,7 +4344,7 @@ def Value instantiate_struct(mut Interpreter interp, StructDecl decl, [Value] ar
                             if let default_expr2 = param_default2:
                                 pval = eval_expr(interp, default_expr2)
                         env_define(interp, param.name, pval, param.mutable)
-                    _ = eval_block(interp, init_decl.body)
+                    _ = eval_body_block(interp, init_decl.body)
                     for field in init_inner.fields:
                         let updated_opt = interp.current_env.get(field.0)
                         if let updated_val = updated_opt:

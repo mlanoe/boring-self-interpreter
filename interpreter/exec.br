@@ -103,6 +103,21 @@ def Signal? exec_if_as_expr(mut Interpreter interp, IfStmt s):
         return ReturnSignal(Value.Nil)
     ReturnSignal(Value.Nil)
 
+# Consumes a pending throw (preferred) or pending return left by an expression evaluated for
+# its value (`let v = match ...`, `loop`, a throwing call) and turns it into a Signal so the
+# statement can stop instead of carrying on with a placeholder Nil.
+def Signal? take_pending_signal(mut Interpreter interp):
+    if interp.has_pending_throw:
+        interp.has_pending_return = false
+        interp.pending_return_val = Value.Nil
+        return ThrowSignal(interp.take_pending_throw())
+    if interp.has_pending_return:
+        let rv = interp.pending_return_val
+        interp.has_pending_return = false
+        interp.pending_return_val = Value.Nil
+        return ReturnSignal(rv)
+    nil
+
 def Signal? exec_match_as_expr(mut Interpreter interp, MatchStmt s):
     let subject = eval_expr(interp, s.subject)
     let result = eval_match(interp, subject, s.arms)
@@ -236,8 +251,9 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
                     ExprKind.Var(src): move_source = some(src)
                     _: nil
                 val = eval_expr(interp, expr)
-                if interp.has_pending_throw:
-                    return ThrowSignal(interp.take_pending_throw())
+                let pending_sig = take_pending_signal(interp)
+                if pending_sig != nil:
+                    return pending_sig
                 # Note: move semantics not enforced in interpreter — all values treated as copyable
                 # Coerce int literals/values to the declared uint/uint8 type — the parser
                 # already recognizes these annotations, but nothing applied them at runtime.
@@ -362,8 +378,9 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
                     _: nil
                 if not hinted:
                     val = eval_expr(interp, expr)
-                if interp.has_pending_throw:
-                    return ThrowSignal(interp.take_pending_throw())
+                let pending_sig = take_pending_signal(interp)
+                if pending_sig != nil:
+                    return pending_sig
             ReturnSignal(val)
 
         Break(line, value_expr):
@@ -446,8 +463,9 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
 
         LetDestructure(s):
             let val = eval_expr(interp, s.value)
-            if interp.has_pending_throw:
-                return ThrowSignal(interp.take_pending_throw())
+            let pending_sig = take_pending_signal(interp)
+            if pending_sig != nil:
+                return pending_sig
             var elems = []
             match val:
                 Value.Tuple(items): elems = items
@@ -698,6 +716,9 @@ def Signal? exec_do_while(mut Interpreter interp, DoWhileStmt s):
 def Signal? exec_if(mut Interpreter interp, IfStmt s):
     for branch in s.branches:
         let cond_val = eval_expr(interp, branch.cond)
+        let cond_sig = take_pending_signal(interp)
+        if cond_sig != nil:
+            return cond_sig
         let b = expect_bool(cond_val)
         if b:
             mut child = new_env(interp.current_env)
@@ -723,6 +744,9 @@ def Signal? exec_while(mut Interpreter interp, WhileStmt s):
     var Signal? result = nil
     while running:
         let cond_val = eval_expr(interp, s.condition)
+        let cond_sig = take_pending_signal(interp)
+        if cond_sig != nil:
+            return cond_sig
         let b = expect_bool(cond_val)
         if not b:
             running = false

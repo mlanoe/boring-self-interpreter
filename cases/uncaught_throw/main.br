@@ -1,0 +1,4 @@
+# A throw that nothing catches must end the program with an error and a non-zero exit code.
+def main() throws:
+    print "before"
+    throw "boom"

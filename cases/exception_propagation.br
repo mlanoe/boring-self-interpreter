@@ -1,0 +1,94 @@
+# A `throw` / `return` raised inside an expression that is evaluated for its value
+# (a `loop`, a `match` arm used as an expression, a condition, an operand, an assignment's
+# right-hand side) must propagate instead of turning into a Nil value.
+def int risky(int n) throws:
+    guard n != 0 else throw "zero"
+    n
+
+def int via_loop() throws:
+    let x = loop:
+        throw "from loop"
+    x
+
+def int loop_return() throws:
+    let x = loop:
+        return 7
+    x + 1000
+
+def int via_match(int n) throws:
+    let v = match n:
+        0: throw "bad match"
+        _: n
+    v + 100
+
+def int early_return(int n) throws:
+    let v = match n:
+        0: return -1
+        _: n
+    v + 100
+
+def int cond_if() throws:
+    if risky(0) > 0:
+        return 1
+    2
+
+def int cond_while() throws:
+    var n = 0
+    while risky(n) > 0:
+        n += 1
+    n
+
+def int operand_add() throws:
+    risky(0) + risky(1)
+
+def bool operand_and() throws:
+    risky(0) > 0 and true
+
+def int sink(int a, int b):
+    a + b
+
+def int side() throws:
+    print "SIDE EFFECT (must not run)"
+    1
+
+def int in_array() throws:
+    let a = [1, risky(0), 3]
+    a[0]
+
+def int in_tuple() throws:
+    let t = (1, risky(0))
+    t.0
+
+def int in_dict() throws:
+    let d = {"a" = risky(0)}
+    d.length
+
+def string in_interp() throws:
+    "value {risky(0)}"
+
+def int in_args() throws:
+    sink(risky(0), side())
+
+print "{try via_loop() else -1}"
+print "{try loop_return() else -1}"
+print "{try via_match(0) else -1}"
+print "{try via_match(5) else -1}"
+print "{try early_return(0) else -2}"
+print "{try early_return(5) else -2}"
+print "{try cond_if() else -3}"
+print "{try cond_while() else -4}"
+print "{try operand_add() else -5}"
+print "{try operand_and() else false}"
+
+var kept = 5
+try:
+    kept = risky(0)
+catch:
+    print "caught"
+print kept
+
+print "{try in_array() else -6}"
+print "{try in_tuple() else -7}"
+print "{try in_dict() else -8}"
+print "{try in_interp() else "interp"}"
+print "{try in_args() else -9}"

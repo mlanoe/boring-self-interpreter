@@ -538,3 +538,15 @@ itest!(array_block_flat_transpile);
 itest!(array_block_keyed_for);
 itest!(array_move_remove_indices);
 itest!(array_block_for_transpile);
+
+// Exceptions raised inside expressions evaluated for their value (`loop`, a `match` arm used as
+// an expression, a condition, an operand, an assignment's right-hand side) must propagate
+// instead of turning into Nil; `return` in a `match` arm must return from the function.
+itest!(exception_propagation);
+
+// A throw that nothing catches ends the program with an error and a non-zero exit code
+// (it used to be dropped silently, exit code 0).
+#[test]
+fn uncaught_throw() {
+    run_file_case_err("uncaught_throw", "main.br", "unhandled exception in main: boom");
+}

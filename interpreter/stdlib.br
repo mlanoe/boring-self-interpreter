@@ -1176,12 +1176,26 @@ def void exec_item(mut Interpreter interp, Item item):
 
 # ─── run_program ──────────────────────────────────────────────────────────────
 
+# A `throw` that reaches the top level (no enclosing `try`/`catch`) is fatal: report it on
+# stderr and exit non-zero, like the Rust interpreter's "unhandled exception" runtime error.
+# Throws travel through `has_pending_throw`, so without this check they were silently dropped.
+def void report_unhandled_exception(mut Interpreter interp, string context):
+    if interp.has_pending_throw:
+        let exc = interp.take_pending_throw()
+        let text = display_value(interp, exc)
+        # Raw `eprintln!` rather than the `error` log builtin, which would prefix `[ERROR] `:
+        # the reference interpreter reports `error: unhandled exception in main: <value>`.
+        eprintln!("error: {}: {}", context, text)
+        exit(1)
+
 def void run_program(mut Interpreter interp, Program prog):
     for item in prog.items:
         exec_item(interp, item)
+        report_unhandled_exception(interp, "unhandled exception")
     # Auto-invoke `main` after registering all top-level items, mirroring the
     # Rust interpreter's entry point — a `.br` program that only declares
     # `def main():` (the standard idiom) must actually run it.
     let main_decl_opt = interp.get_fn_decl("main")
     if let main_decl = main_decl_opt:
         _ = call_fn(interp, main_decl, [], nil)
+        report_unhandled_exception(interp, "unhandled exception in main")
