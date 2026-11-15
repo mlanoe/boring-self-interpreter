@@ -1114,7 +1114,7 @@ def void report_view_callback(mut Interpreter interp, Value hv):
             mut [string] m_names = []
             mut [[string]] m_calls = []
             mut [[string]] m_binds = []
-            mut [string] local_ok = []
+            var mut [string] local_ok = []
             for m in decl.methods:
                 if m.name == "body":
                     continue

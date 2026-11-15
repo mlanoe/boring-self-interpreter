@@ -1224,7 +1224,7 @@ def Value run_kernel_inner(mut Interpreter interp, Value kself, ObjectInner'acto
             _: nil
     # The body, cut at each top-level `sync`.
     mut [[Stmt]] phases = []
-    mut [Stmt] current = []
+    var mut [Stmt] current = []
     for st in entry.body:
         if stmt_is_sync(st):
             phases.push(current)
@@ -1719,7 +1719,7 @@ def [Value] collect_array_block(mut Interpreter interp, ClosureBody body, Env? c
     interp.current_env = new_env(captured)
     let saved_site_on = interp.block_site_on
     let saved_site = interp.block_site
-    mut [Value] values = []
+    var mut [Value] values = []
     match body:
         ClosureBody.Block(stmts):
             var tagged = false

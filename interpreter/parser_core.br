@@ -811,7 +811,7 @@ def Type parse_type(mut Parser p) throws:
     match base:
         Type.Named(fn_nm):
             if fn_nm == "Fn" and parser_check(p, "LParen"):
-                p.advance()
+                _ = p.advance()
                 while p.peek() != TokenKind.RParen and p.peek() != TokenKind.Eof:
                     _ = parse_type(p)
                     if p.peek() != TokenKind.RParen:
