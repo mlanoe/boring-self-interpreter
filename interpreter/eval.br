@@ -993,7 +993,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             # A throwing right-hand side must not overwrite the target with Nil.
             if interp.has_pending_throw:
                 return Value.Nil
-            let val = byvalue_store(interp, val_expr, val0)
+            let val = byvalue_store(interp, val_expr, val0, assign_dest_type(interp, target))
             # `g = f` / `p.v = f` where the slot holds a fixed-point value: only an
             # untyped literal may adopt its format.
             match val:
