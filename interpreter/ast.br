@@ -367,6 +367,7 @@ struct ForStmt:
     [string] vars
     Expr iterable
     Expr? key
+    Expr? where_expr
     [Stmt] body
     int line
 
@@ -437,6 +438,21 @@ enum ClosureBody:
     Expr(Expr expr)
     Block([Stmt] stmts)
 
+enum QueryKind:
+    All
+    Single
+    First
+    Any
+
+struct QueryExpr:
+    QueryKind kind
+    bool is_optional
+    [string] vars
+    Expr iterable
+    Expr? where_clause
+    Expr? projection
+    int line
+
 enum ExprKind:
     Int(int n)
     UInt64(uint64 n)
@@ -494,6 +510,7 @@ enum ExprKind:
     VarPat(string name)
     TuplePat([Expr] pats)
     EnumPat(string type_name, string variant, [Expr] field_pats)
+    Query(QueryExpr query)
 
 # ─── Operators ────────────────────────────────────────────────────────────────
 

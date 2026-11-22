@@ -797,15 +797,28 @@ def Signal? exec_for(mut Interpreter interp, ForStmt s):
                         child.define_mut(vars[1], item)
         let prev = interp.current_env
         interp.current_env = child
-        let sig = exec_block(interp, s.body)
+
+        var skip = false
+        if let where_e = s.where_expr:
+            let cond_val = eval_expr(interp, where_e)
+            let cond_sig = take_pending_signal(interp)
+            if cond_sig != nil:
+                interp.current_env = prev
+                return cond_sig
+            if not expect_bool(cond_val):
+                skip = true
+
+        if not skip:
+            let sig = exec_block(interp, s.body)
+            match sig:
+                nil: nil
+                BreakSignal(_): done = true
+                ContinueSignal: nil
+                _:
+                    done = true
+                    result = sig
+
         interp.current_env = prev
-        match sig:
-            nil: nil
-            BreakSignal(_): done = true
-            ContinueSignal: nil
-            _:
-                done = true
-                result = sig
     result
 
 # ─── collect_iterable ─────────────────────────────────────────────────────────
@@ -835,21 +848,38 @@ def [Value] collect_iterable(Value val):
             out
         _: throw "value is not iterable"
 
-def [Value] collect_iterable_with_interp(Interpreter interp, Value val):
+def [Value] collect_iterable_with_interp(mut Interpreter interp, Value val):
     match val:
-        Value.Object(rx_inner):
-            if rx_inner.type_name != "__ChannelRx__":
-                throw "value is not iterable"
-            let ch_id_opt = rx_inner.get_field("__ch_id__")
-            if let ch_id_val = ch_id_opt:
-                let ch_key = match ch_id_val:
-                    Value.Str(s): s
-                    _: ""
-                if ch_key != "":
-                    let queue_opt = interp.channel_queues.get(ch_key)
-                    if let q = queue_opt:
-                        return q
-            []
+        Value.Object(inner):
+            if inner.type_name == "__ChannelRx__":
+                let ch_id_opt = inner.get_field("__ch_id__")
+                if let ch_id_val = ch_id_opt:
+                    let ch_key = match ch_id_val:
+                        Value.Str(s): s
+                        _: ""
+                    if ch_key != "":
+                        let queue_opt = interp.channel_queues.get(ch_key)
+                        if let q = queue_opt:
+                            return q
+                return []
+            var has_next = false
+            if let sd = interp.get_struct_decl(inner.type_name):
+                for m in sd.methods:
+                    if m.name == "next":
+                        has_next = true
+            if has_next:
+                mut [Value] items = []
+                var iter_val = val
+                var done = false
+                while not done:
+                    let item = call_method(interp, iter_val, "next", [])
+                    if interp.has_pending_throw:
+                        throw interp.take_pending_throw()
+                    match item:
+                        Value.Nil: done = true
+                        _: items.push(item)
+                return items
+            throw "value is not iterable"
         _: collect_iterable(val)
 
 # ─── exec_match_stmt ──────────────────────────────────────────────────────────
@@ -1201,6 +1231,7 @@ def bool stmts_may_write(mut Interpreter interp, [Stmt] stmts, string name):
 
 def bool stmt_is_sync(Stmt st):
     match st:
+        Stmt.Comment(c): c == "sync"
         Stmt.Expr(e):
             match e.kind:
                 ExprKind.Var(n): n == "sync"

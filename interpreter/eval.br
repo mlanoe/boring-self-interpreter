@@ -680,8 +680,19 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     if offset < 0 or offset >= elems.length:
                         throw "labeled array index out of bounds (length {elems.length})"
                     elems[offset]
+                Value.Object(inner):
+                    let type_name = inner.type_name
+                    var has_get = false
+                    if let sd = interp.get_struct_decl(type_name):
+                        for m in sd.methods:
+                            if m.name == "get":
+                                has_get = true
+                    if has_get:
+                        let arg_vals = eval_args(interp, args)
+                        return call_method(interp, obj, "get", arg_vals)
+                    throw "cannot index into {type_name}: method 'get' is not defined"
                 _:
-                    throw "labeled index requires a labeled array, got {obj.type_name()}"
+                    throw "cannot index into {obj.type_name()}"
 
         # Array literal
         ExprKind.Array(elems):
@@ -1207,8 +1218,117 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     results.push(join_val)
             Value.Array(results)
 
+        ExprKind.Query(q):
+            eval_query_expr(interp, q, expr.line)
+
         _:
             throw "unhandled expression kind"
+
+def [Value] eval_args(mut Interpreter interp, [Arg] args):
+    eval_args_with_hints(interp, args, [])
+
+def Value eval_query_expr(mut Interpreter interp, QueryExpr q, int line):
+    let iterable_val = eval_expr(interp, q.iterable)
+    if interp.has_pending_throw:
+        return Value.Nil
+    let items = collect_iterable_with_interp(interp, iterable_val)
+    mut [Value] filtered_projected = []
+
+    var idx = 0
+    var done = false
+    while not done and idx < items.length:
+        let item = items[idx]
+        idx = idx + 1
+        mut child = new_env(interp.current_env)
+        let vars = q.vars
+        if vars.length == 1:
+            child.define_mut(vars[0], item)
+        else:
+            match item:
+                Tuple(elems):
+                    var i = 0
+                    for v in vars:
+                        let val = if i < elems.length: elems[i] else: Value.Nil
+                        child.define_mut(v, val)
+                        i = i + 1
+                _:
+                    child.define_mut(vars[0], Value.Int(idx - 1))
+                    if vars.length >= 2:
+                        child.define_mut(vars[1], item)
+                    var vi = 2
+                    while vi < vars.length:
+                        child.define_mut(vars[vi], Value.Nil)
+                        vi = vi + 1
+
+        let prev = interp.current_env
+        interp.current_env = child
+
+        var keep = true
+        if let where_clause = q.where_clause:
+            let cond_val = eval_expr(interp, where_clause)
+            if interp.has_pending_throw:
+                interp.current_env = prev
+                return Value.Nil
+            if not expect_bool(cond_val):
+                keep = false
+
+        if keep:
+            var result_item = Value.Nil
+            if let proj = q.projection:
+                result_item = eval_expr(interp, proj)
+                if interp.has_pending_throw:
+                    interp.current_env = prev
+                    return Value.Nil
+            elif q.vars.length == 1:
+                let v_opt = child.get(q.vars[0])
+                if let v = v_opt:
+                    result_item = v
+            else:
+                mut [Value] tuple_items = []
+                for v in q.vars:
+                    let v_opt = child.get(v)
+                    if let val = v_opt:
+                        tuple_items.push(val)
+                    else:
+                        tuple_items.push(Value.Nil)
+                result_item = Value.Tuple(tuple_items)
+
+            filtered_projected.push(result_item)
+
+            match q.kind:
+                QueryKind.First | QueryKind.Any:
+                    done = true
+                QueryKind.Single:
+                    if filtered_projected.length > 1:
+                        interp.current_env = prev
+                        throw "query single: expected at most one matching element, found multiple"
+                _: nil
+
+        interp.current_env = prev
+
+    match q.kind:
+        QueryKind.All:
+            Value.Array(filtered_projected)
+        QueryKind.First | QueryKind.Any:
+            if filtered_projected.length > 0:
+                filtered_projected[0]
+            elif q.is_optional:
+                Value.Nil
+            else:
+                let name = match q.kind:
+                    QueryKind.First: "query first"
+                    _: "query any"
+                throw "{name}: matching element not found"
+        QueryKind.Single:
+            if filtered_projected.length == 1:
+                filtered_projected[0]
+            elif filtered_projected.length == 0:
+                if q.is_optional:
+                    Value.Nil
+                else:
+                    throw "query single: no matching element found"
+            else:
+                throw "query single: expected at most one matching element, found multiple"
 
 # DotIdent: .Variant — search all known enums for a matching variant. Ambiguous when more
 # than one enum defines the same variant name — mirrors the Rust interpreter's ambiguous-
@@ -2772,6 +2892,16 @@ def Value get_index(mut Interpreter interp, Value obj, Value idx):
                     Value.Int(actual)
                 _:
                     throw "range index must be Int"
+        Value.Object(inner):
+            let type_name = inner.type_name
+            var has_get = false
+            if let sd = interp.get_struct_decl(type_name):
+                for m in sd.methods:
+                    if m.name == "get":
+                        has_get = true
+            if has_get:
+                return call_method(interp, obj, "get", [idx])
+            throw "cannot index into {type_name}: method 'get' is not defined"
         _:
             throw "cannot index into {obj.type_name()}"
 
@@ -4164,11 +4294,14 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                         while si < decl.setters.length and not interp.in_setter:
                             let s = decl.setters[si]
                             if s.name == field_name:
+                                let prev_in_setter = interp.in_setter
+                                interp.in_setter = true
                                 let child_env = push_scope(interp)
                                 env_define(interp, "self", Value.Object(inner), true)
                                 env_define(interp, s.param_name, val, true)
                                 _ = eval_body_block(interp, s.body)
                                 pop_scope(interp)
+                                interp.in_setter = prev_in_setter
                                 setter_called = true
                                 break
                             si = si + 1
@@ -4202,12 +4335,25 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                     var di = 0
                     while di < new_entries.length:
                         if values_equal(new_entries[di].0, idx):
-                            new_entries[di] = (idx, val)
+                            let coerced_val = coerce_float_literal(new_entries[di].1, val)
+                            new_entries[di] = (idx, coerced_val)
                             found = true
                         di = di + 1
                     if not found:
-                        new_entries.push((idx, val))
+                        let coerced_val = if new_entries.length > 0: coerce_float_literal(new_entries[0].1, val) else: val
+                        new_entries.push((idx, coerced_val))
                     assign_target(interp, obj_expr, Value.Dict(new_entries))
+                Value.Object(inner):
+                    let type_name = inner.type_name
+                    var has_set = false
+                    if let sd = interp.get_struct_decl(type_name):
+                        for m in sd.methods:
+                            if m.name == "set":
+                                has_set = true
+                    if has_set:
+                        _ = call_method(interp, obj, "set", [idx, val])
+                        return
+                    throw "cannot index-assign on {type_name}: method 'set' is not defined"
                 _:
                     throw "cannot index-assign into {obj.type_name()}"
         ExprKind.LabeledIndex(obj_expr, args):
@@ -4219,8 +4365,21 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                         throw "labeled array index out of bounds (length {items.length})"
                     items[offset] = val
                     assign_target(interp, obj_expr, Value.LabeledArray(items, axes))
+                Value.Object(inner):
+                    let type_name = inner.type_name
+                    var has_set = false
+                    if let sd = interp.get_struct_decl(type_name):
+                        for m in sd.methods:
+                            if m.name == "set":
+                                has_set = true
+                    if has_set:
+                        mut arg_vals = eval_args(interp, args)
+                        arg_vals.push(val)
+                        _ = call_method(interp, obj, "set", arg_vals)
+                        return
+                    throw "cannot index-assign on {type_name}: method 'set' is not defined"
                 _:
-                    throw "labeled index requires a labeled array, got {obj.type_name()}"
+                    throw "cannot index-assign on non-object"
         _:
             throw "invalid assignment target"
 
@@ -4251,12 +4410,25 @@ def Value default_value_for_type(Type ty):
         Type.Str: Value.Str("")
         Type.Optional(_): Value.Nil
         Type.Array(_): Value.Array([])
-        Type.ArrayN(_, _): Value.Array([])
+        Type.ArrayN(elem_ty, n):
+            mut [Value] items = []
+            let elem_default = default_value_for_type(elem_ty)
+            var i = 0
+            while i < n:
+                items.push(elem_default)
+                i = i + 1
+            Value.Array(items)
         Type.Dict(_, _): Value.Dict([])
         Type.Set(_): Value.Set([])
         Type.Tuple(elems): Value.Tuple(elems.map((e): default_value_for_type(e)))
         Type.Qualified(inner, _): default_value_for_type(inner)
         _: Value.Nil
+
+def bool type_has_fixed_array(Type ty):
+    match ty:
+        Type.ArrayN(_, _): true
+        Type.Qualified(inner, _): type_has_fixed_array(inner)
+        _: false
 
 # Instantiate a struct from constructor args
 def Value instantiate_struct(mut Interpreter interp, StructDecl decl, [Value] args):
@@ -4284,7 +4456,7 @@ def Value instantiate_struct(mut Interpreter interp, StructDecl decl, [Value] ar
             var fval = Value.Nil
             if let default_expr = field.default:
                 fval = eval_expr(interp, default_expr)
-            elif default_rest:
+            elif default_rest or type_has_fixed_array(field.ty):
                 fval = default_value_for_type(field.ty)
             elif attrs_have(field.attrs, "inject"):
                 # `@inject`: the omitted argument is the result of the `@provide` function

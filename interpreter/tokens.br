@@ -75,6 +75,11 @@ enum TokenKind:
     Native
     Mod
     Kernel
+    Where
+    Sync
+    Data
+    Component
+    Resource
 
     # Operators
     Plus
@@ -191,4 +196,9 @@ struct Token:
             TokenKind.Wait: "wait"
             TokenKind.Task: "task"
             TokenKind.Void: "void"
+            TokenKind.Where: "where"
+            TokenKind.Sync: "sync"
+            TokenKind.Data: "data"
+            TokenKind.Component: "component"
+            TokenKind.Resource: "resource"
             _: ""

@@ -77,7 +77,7 @@ def int measure_indent(string line):
 # ── Preprocess triple strings ────────────────────────────────────────────────
 
 def string dedent_triple(string raw):
-    var s = raw
+    var s = raw.replace("\r\n", "\n").replace("\r", "\n")
     if s.startsWith("\n"):
         s = s.slice(1, s.length)
     if s.endsWith("\n"):
@@ -371,7 +371,8 @@ def bool tick_in_fn_header([string] chars, int i):
     return false
 
 def string preprocess_triple_strings(string source):
-    let chars = source.chars()
+    let normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+    let chars = normalized.chars()
     let n = chars.length
     var result = ""
     var i = 0
@@ -955,6 +956,11 @@ struct Lexer:
             "native": return TokenKind.Native
             "mod": return TokenKind.Mod
             "kernel": return TokenKind.Kernel
+            "where": return TokenKind.Where
+            "sync": return TokenKind.Sync
+            "data": return TokenKind.Data
+            "component": return TokenKind.Component
+            "resource": return TokenKind.Resource
             "true": return TokenKind.Bool(true)
             "false": return TokenKind.Bool(false)
             "nil": return TokenKind.Nil

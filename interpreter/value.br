@@ -217,6 +217,24 @@ struct Sockets:
         guard let n = r else throw "read failed"
         (bytes, n as int)
 
+def Value coerce_float_literal(Value existing, Value value):
+    match existing:
+        Value.Float32(_):
+            match value:
+                Value.Float64(f): Value.Float32(f as float32)
+                Value.Int(n): Value.Float32((n as float) as float32)
+                _: value
+        Value.Float16(_):
+            match value:
+                Value.Float64(f): Value.Float16(f as float16)
+                Value.Int(n): Value.Float16((n as float) as float16)
+                _: value
+        Value.Float64(_):
+            match value:
+                Value.Int(n): Value.Float64(n as float)
+                _: value
+        _: value
+
 struct Env:
     var {string=Value} vars
     {string} mutable_vars
@@ -255,14 +273,15 @@ struct Env:
 
     def bool set(string name, Value value):
         if self.vars.has(name):
+            let val_to_set = coerce_float_literal(self.vars[name], value)
             if self.lazy_vars.contains(name):
-                self.vars.set(name, value)
+                self.vars.set(name, val_to_set)
                 self.lazy_vars.remove(name)
                 true
             elif not self.mutable_vars.contains(name):
                 false
             else:
-                self.vars.set(name, value)
+                self.vars.set(name, val_to_set)
                 true
         else:
             if let p = self.parent:
@@ -293,7 +312,8 @@ struct Env:
 
     def bool force_set(string name, Value value):
         if self.vars.has(name):
-            self.vars.set(name, value)
+            let val_to_set = coerce_float_literal(self.vars[name], value)
+            self.vars.set(name, val_to_set)
             true
         else:
             if let p = self.parent:

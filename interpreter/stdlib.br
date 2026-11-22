@@ -925,7 +925,7 @@ def bool item_is_pub(Item item):
 def string use_join_path(string base, string rel):
     if base.length == 0:
         return rel
-    if base.endsWith("/"):
+    if base.endsWith("/") or base.endsWith("\\"):
         return base + rel
     base + "/" + rel
 
@@ -948,7 +948,8 @@ def string use_boring_stdlib_rel_path(UseDecl decl):
     rel + ".br"
 
 def string use_dirname(string path):
-    let parts = path.split("/")
+    let norm = path.replace("\\", "/")
+    let parts = norm.split("/")
     if parts.length <= 1:
         return ""
     var string out = parts[0]
@@ -966,8 +967,12 @@ def void exec_use(mut Interpreter interp, UseDecl decl):
     var string? found = nil
     if prefix == "boring" and fs.exists(rel):
         found = rel
+    elif prefix == "boring" and fs.exists("boring/" + rel):
+        found = "boring/" + rel
     else:
-        found = interp.find_module_file(rel)
+        found = interp.find_module_file(rel.clone())
+        if found == nil and prefix == "boring":
+            found = interp.find_module_file("boring/" + rel)
     guard let abs = found else:
         if prefix == "boring":
             error "unknown Boring standard library module '{decl.path.join(".")}'"

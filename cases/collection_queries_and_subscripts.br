@@ -1,0 +1,92 @@
+struct CustomMap:
+    mut [string] keys
+    mut [int] vals
+
+    req int get(string k):
+        var i = 0
+        while i < self.keys.length:
+            if self.keys[i] == k:
+                return self.vals[i]
+            i = i + 1
+        -1
+
+    def void set(string k, int v):
+        var i = 0
+        while i < self.keys.length:
+            if self.keys[i] == k:
+                self.vals[i] = v
+                return
+            i = i + 1
+        self.keys.push(k)
+        self.vals.push(v)
+
+let mut m = CustomMap(keys = ["a", "b"], vals = [10, 20])
+print m["a"]
+m["a"] = 99
+print m["a"]
+m["c"] = 300
+print m["c"]
+
+# Soft keywords
+let where = 42
+let get = 100
+let set = 200
+print where + get + set
+
+# Filtered for loops
+mut [int] evens = []
+for x in [1, 2, 3, 4, 5, 6] where x % 2 == 0:
+    evens.push(x)
+print evens
+
+# Collection queries
+let nums = [1, 2, 3, 4, 5, 6, 7, 8]
+let q_all = query all x in nums where x > 4 |> x * 10
+print q_all
+
+let q_first = query first x in nums where x % 2 == 0
+print q_first
+
+let q_opt = query first? x in nums where x > 100
+print q_opt
+
+let q_single = query single x in nums where x == 5
+print q_single
+
+# Custom iterator protocol
+struct Counter:
+    var int current
+    int max
+
+    def int? next():
+        if self.current >= self.max:
+            return nil
+        let val = self.current
+        self.current = self.current + 1
+        val
+
+let mut cnt = Counter(current = 1, max = 4)
+mut [int] from_iter = []
+for c in cnt:
+    from_iter.push(c)
+print from_iter
+
+# Labeled subscripts
+struct Grid:
+    mut [int] cells # 3x3 grid
+
+    req int get(int row, int col):
+        self.cells[row * 3 + col]
+
+    def void set(int row, int col, int value):
+        self.cells[row * 3 + col] = value
+
+let mut g = Grid(cells = [0, 0, 0, 0, 0, 0, 0, 0, 0])
+g[row = 1, col = 2] = 42
+print g[row = 1, col = 2]
+
+# Query with tuple destructuring
+let pairs = [("alice", 25), ("bob", 30), ("charlie", 35)]
+let names_over_28 = query all (name, age) in pairs where age > 28 |> name
+print names_over_28
+

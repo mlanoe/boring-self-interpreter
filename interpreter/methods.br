@@ -1967,6 +1967,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             var result = arr
                             result.push(other_val)
                             Value.Array(result)
+                "collect":
+                    Value.Array(arr)
                 "push":
                     let val = args[0] else Value.Nil
                     var result = arr

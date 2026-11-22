@@ -738,8 +738,83 @@ def Expr parse_primary(mut Parser p) throws:
     if parser_check(p, "SelfKw"):
         parser_advance(p)
         return make_var_expr("self", line)
-    if parser_check(p, "Ident"):
+    if parser_peek_is_ident(p):
         let name = parser_peek_ident(p)
+        if name == "query":
+            var i = p.pos + 1
+            if i < p.tokens.length:
+                let sub_name = match p.tokens[i].kind:
+                    TokenKind.Ident(s): s
+                    _: ""
+                if sub_name == "all" or sub_name == "single" or sub_name == "first" or sub_name == "any":
+                    i = i + 1
+                    if i < p.tokens.length and token_kind_name(p.tokens[i].kind) == "Question":
+                        i = i + 1
+            var found_in = false
+            while i < p.tokens.length and not found_in:
+                let tk_name = token_kind_name(p.tokens[i].kind)
+                if tk_name == "In":
+                    found_in = true
+                elif tk_name == "Colon" or tk_name == "Newline" or tk_name == "Eof" or tk_name == "Semicolon" or tk_name == "Where":
+                    break
+                else:
+                    i = i + 1
+            if found_in:
+                _ = parser_advance(p)
+                var kind = QueryKind.All
+                var is_optional = false
+                let sub = parser_peek_ident(p)
+                if sub == "all":
+                    _ = parser_advance(p)
+                    kind = QueryKind.All
+                elif sub == "single":
+                    _ = parser_advance(p)
+                    is_optional = parser_eat(p, "Question")
+                    kind = QueryKind.Single
+                elif sub == "first":
+                    _ = parser_advance(p)
+                    is_optional = parser_eat(p, "Question")
+                    kind = QueryKind.First
+                elif sub == "any":
+                    _ = parser_advance(p)
+                    is_optional = parser_eat(p, "Question")
+                    kind = QueryKind.Any
+                mut [string] vars = []
+                if parser_eat(p, "LParen"):
+                    while not parser_check(p, "RParen") and not parser_check(p, "Eof"):
+                        vars.push(parser_expect_ident(p))
+                        if not parser_eat(p, "Comma"):
+                            break
+                    parser_expect(p, "RParen")
+                else:
+                    vars.push(parser_expect_ident(p))
+                    while parser_eat(p, "Comma"):
+                        vars.push(parser_expect_ident(p))
+                parser_expect(p, "In")
+                let iterable = parse_or(p)
+                var Expr? where_clause = nil
+                if parser_eat(p, "Where"):
+                    where_clause = parse_or(p)
+                var Expr? projection = nil
+                if parser_check(p, "PipeArrow"):
+                    var next_is_collect = false
+                    if p.pos + 1 < p.tokens.length:
+                        match p.tokens[p.pos + 1].kind:
+                            TokenKind.Ident(id):
+                                if id == "collect":
+                                    next_is_collect = true
+                            TokenKind.Dot:
+                                if p.pos + 2 < p.tokens.length:
+                                    match p.tokens[p.pos + 2].kind:
+                                        TokenKind.Ident(id2):
+                                            if id2 == "collect":
+                                                next_is_collect = true
+                                        _: nil
+                            _: nil
+                    if not next_is_collect:
+                        _ = parser_advance(p)
+                        projection = parse_or(p)
+                return make_query_expr(kind, is_optional, vars, iterable, where_clause, projection, line)
         if parser_peek_is_macro_call(p):
             parser_advance(p)
             parser_advance(p)
@@ -1457,6 +1532,9 @@ def Stmt parse_stmt(mut Parser p) throws:
                 let s = parse_stmt(p)
                 [s]
             return stmt_kernel_block(body, kline)
+    if parser_check(p, "Sync"):
+        parser_advance(p)
+        return Stmt.Comment("sync")
     if parser_check(p, "Task"):
         if parser_peek_next_is(p, "Def"):
             return stmt_fn(parse_fn_decl(p, false, true))
@@ -1776,11 +1854,21 @@ def ForStmt parse_for_stmt(mut Parser p) throws:
     parser_set_allow_noparen_closure(p, saved)
     parser_set_allow_trailing_closure(p, true)
     var Expr? key = nil
-    if parser_eat(p, "With"):
-        let saved_key = parser_get_allow_noparen_closure(p)
-        parser_set_allow_noparen_closure(p, false)
-        key = parse_expr(p)
-        parser_set_allow_noparen_closure(p, saved_key)
+    var Expr? where_expr = nil
+    var done_clauses = false
+    while not done_clauses:
+        if key == nil and parser_eat(p, "With"):
+            let saved_key = parser_get_allow_noparen_closure(p)
+            parser_set_allow_noparen_closure(p, false)
+            key = parse_expr(p)
+            parser_set_allow_noparen_closure(p, saved_key)
+        elif where_expr == nil and parser_eat(p, "Where"):
+            let saved_where = parser_get_allow_noparen_closure(p)
+            parser_set_allow_noparen_closure(p, false)
+            where_expr = parse_expr(p)
+            parser_set_allow_noparen_closure(p, saved_where)
+        else:
+            done_clauses = true
     parser_expect(p, "Colon")
     let body = if not parser_is_newline(p) and not parser_check(p, "Eof"):
         let stmts = parse_inline_stmts(p)
@@ -1789,7 +1877,7 @@ def ForStmt parse_for_stmt(mut Parser p) throws:
     else:
         parser_expect_newline(p)
         parse_block(p)
-    make_for_stmt(vars_iterable.0, vars_iterable.1, key, body, line)
+    make_for_stmt(vars_iterable.0, vars_iterable.1, key, where_expr, body, line)
 
 # `with <name> [, <name> ...]:` — scoped access block. Each name must already be
 # bound in scope; qualifier and read/write access level are resolved elsewhere,
