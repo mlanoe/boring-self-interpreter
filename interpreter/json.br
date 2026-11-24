@@ -389,7 +389,7 @@ def string json_serialize(mut Interpreter interp, Value v):
         Value.Float32(f): json_float_text(f as float64)
         Value.Float16(f): json_float_text((f as float32) as float64)
         Value.Str(s): json_escape_string(s)
-        Value.Array(items): json_serialize_list(interp, items)
+        Value.Array(items): json_serialize_list(interp, items.clone_elems())
         Value.Tuple(items): json_serialize_list(interp, items)
         Value.Set(items): json_serialize_list(interp, items)
         Value.Dict(pairs):
@@ -608,7 +608,7 @@ def Value json_to_value(mut Interpreter interp, JVal j, Type ty0) throws:
                     mut [Value] out = []
                     for item in items:
                         out.push(json_to_value(interp, item, elem))
-                    Value.Array(out)
+                    val_array(out)
                 _: throw "expected an array"
         Type.ArrayN(elem, n):
             match j:
@@ -618,7 +618,7 @@ def Value json_to_value(mut Interpreter interp, JVal j, Type ty0) throws:
                     mut [Value] out = []
                     for item in items:
                         out.push(json_to_value(interp, item, elem))
-                    Value.Array(out)
+                    val_array(out)
                 _: throw "expected an array"
         Type.Set(elem):
             match j:

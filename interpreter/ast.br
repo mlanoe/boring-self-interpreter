@@ -370,6 +370,10 @@ struct ForStmt:
     Expr? where_expr
     [Stmt] body
     int line
+    [string?] ecs_types = []
+    [bool] ecs_muts = []
+    [bool] ecs_options = []
+    [{string=string}] ecs_where = []
 
 struct GuardStmt:
     GuardCond cond
@@ -444,6 +448,18 @@ enum QueryKind:
     First
     Any
 
+struct EcsFetchComponent:
+    string type_name
+    bool is_mut
+    bool is_option
+
+struct EcsFetchExpr:
+    QueryKind kind
+    bool is_optional
+    [EcsFetchComponent] components
+    [{string=string}] where_clause
+    int line
+
 struct QueryExpr:
     QueryKind kind
     bool is_optional
@@ -511,6 +527,7 @@ enum ExprKind:
     TuplePat([Expr] pats)
     EnumPat(string type_name, string variant, [Expr] field_pats)
     Query(QueryExpr query)
+    EcsFetch(EcsFetchExpr fetch)
 
 # ─── Operators ────────────────────────────────────────────────────────────────
 

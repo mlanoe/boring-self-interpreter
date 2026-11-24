@@ -304,6 +304,12 @@ def Value clone_value(mut Interpreter interp, Value v):
                     i += 1
                 return Value.Object(ObjectInner(type_name= inner.type_name, fields= copied))
             return v
+        Value.Array(arr_inner):
+            let elems = arr_inner.clone_elems()
+            mut [Value] copied_elems = []
+            for e in elems:
+                copied_elems.push(clone_value(interp, e))
+            return val_array(copied_elems)
         _:
             return v
 
@@ -457,14 +463,14 @@ Value? fs_method(mut Interpreter interp, Value recv, string method_name, [Value]
                 mut [Value] lines = []
                 for line in content.lines():
                     lines.push(Value.Str(line))
-                return Value.Array(lines)
+                return val_array(lines)
             if method_name == "readBytes":
                 let data = try? fs.readBytes(path.clone())
                 guard let bytes = data else: return fs_fail(interp, "fs.readBytes: cannot read '{path}'")
                 mut [Value] vals = []
                 for b in bytes:
                     vals.push(Value.Uint8(b))
-                return Value.Array(vals)
+                return val_array(vals)
             if method_name == "write" or method_name == "append":
                 let second = args[1] else Value.Nil
                 var string text = ""
@@ -563,7 +569,8 @@ def Value net_object(string type_name, int id):
 def [uint8]? net_bytes_arg([Value] args):
     let first = args[0] else Value.Nil
     match first:
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             mut [uint8] out = []
             for it in items:
                 match it:
@@ -631,7 +638,8 @@ def (Value, Value)? net_read(mut Interpreter interp, Value sock, Value buf, bool
         _: return nil
     mut [uint8] bytes = []
     match buf:
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             for it in items:
                 match it:
                     Value.Uint8(b): bytes.push(b)
@@ -645,8 +653,8 @@ def (Value, Value)? net_read(mut Interpreter interp, Value sock, Value buf, bool
     for b in res.0:
         out.push(Value.Uint8(b))
     if exact:
-        return (Value.Array(out), Value.Void)
-    (Value.Array(out), Value.Uint(res.1 as uint))
+        return (val_array(out), Value.Void)
+    (val_array(out), Value.Uint(res.1 as uint))
 
 # `Introspect` (`x.introspect()`): `info.typeName`, `info.variantName`, `info.fields`, and
 # `Field.get(instance)` returning a `FieldValue`-wrapped value — what the transpiled program sees.
@@ -817,7 +825,8 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                     return nil
                 mut [Value] call_args = []
                 match args[0]:
-                    Value.Array(items):
+                    Value.Array(arr_inner):
+                        let items = arr_inner.clone_elems()
                         for it in items:
                             match it:
                                 Value.EnumVariant(fvn, _, fvf):
@@ -841,7 +850,7 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                     let rebindable = tv.mutable and introspect_prim_kind(tv.ty) != ""
                     flds.push(introspect_field_full(tv.name, i, tv.is_pub, false, false, rebindable, sd.name, "type"))
                     i += 1
-                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(sd.name)), ("fields", Value.Array(flds)), ("methods", Value.Array(introspect_methods(sd.name, sd.methods, sd.type_methods)))]))
+                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(sd.name)), ("fields", val_array(flds)), ("methods", val_array(introspect_methods(sd.name, sd.methods, sd.type_methods)))]))
             nil
         Value.EnumVariant(tname, vname, _):
             if method_name == "introspect" and args.length == 0:
@@ -856,7 +865,7 @@ Value? introspect_method(mut Interpreter interp, Value recv, string method_name,
                                 fname = vfn
                             flds.push(introspect_field(fname, j))
                             j += 1
-                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(ed.name)), ("variantName", Value.Str(vname)), ("fields", Value.Array(flds)), ("methods", Value.Array(introspect_methods(ed.name, ed.methods, ed.type_methods)))]))
+                return Value.Object(ObjectInner(type_name= "IntrospectInfo", fields= [("typeName", Value.Str(ed.name)), ("variantName", Value.Str(vname)), ("fields", val_array(flds)), ("methods", val_array(introspect_methods(ed.name, ed.methods, ed.type_methods)))]))
             nil
         _: nil
 
@@ -943,7 +952,7 @@ def Value? view_modifier_call(mut Interpreter interp, Value recv, string method_
                     if positional < inputs.length:
                         ctor_args.push(Value.Labeled(inputs[positional], a))
                     positional = positional + 1
-        ctor_args.push(Value.Labeled("children", Value.Array([recv])))
+        ctor_args.push(Value.Labeled("children", val_array([recv])))
         return instantiate_struct(interp, mdecl, ctor_args)
     nil
 
@@ -1241,7 +1250,7 @@ def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInn
     if method_name == "viewChildren":
         if let c = inner.get_field("children"):
             return c
-        return Value.Array([])
+        return val_array([])
     if method_name == "viewKey":
         if let k = inner.get_field("key"):
             return k
@@ -1408,7 +1417,7 @@ def Value? view_runtime_method(mut Interpreter interp, Value self_val, ObjectInn
             var [Value] scope = []
             if method_name == "expandIn" and args.length > 1:
                 match args[1]:
-                    Value.Array(sc): scope = sc
+                    Value.Array(sc): scope = sc.clone_elems()
                     _: nil
             guard let edecl = interp.get_struct_decl(env_name) else: return Value.Nil
             mut [Value] env_args = []
@@ -1709,7 +1718,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let sep = args[0] else Value.Str("")
                     match sep:
                         Value.Str(sv):
-                            Value.Array(s.split(sv).map((part): Value.Str(part)))
+                            val_array(s.split(sv).map((part): Value.Str(part)))
                         _: throw "split: expected string separator"
                 "trim":
                     Value.Str(s.trim())
@@ -1775,13 +1784,13 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 "to_lower":
                     Value.Str(s.toLower())
                 "chars":
-                    Value.Array(s.chars().map((c): Value.Str(c)))
+                    val_array(s.chars().map((c): Value.Str(c)))
                 "as_bytes":
-                    Value.Array(s.as_bytes().map((b): Value.Uint8(b)))
+                    val_array(s.as_bytes().map((b): Value.Uint8(b)))
                 "asBytes":
-                    Value.Array(s.as_bytes().map((b): Value.Uint8(b)))
+                    val_array(s.as_bytes().map((b): Value.Uint8(b)))
                 "graphemes":
-                    Value.Array(s.graphemes().map((g): Value.Str(g)))
+                    val_array(s.graphemes().map((g): Value.Str(g)))
                 "graphemeSlice":
                     let gn = s.graphemeCount
                     let from_raw = match (args[0] else Value.Int(0)):
@@ -1795,7 +1804,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let to_i = to_raw.max(0).min(gn)
                     Value.Str(s.graphemeSlice(from_i, to_i))
                 "lines":
-                    Value.Array(s.split("\n").map((l): Value.Str(l)))
+                    val_array(s.split("\n").map((l): Value.Str(l)))
                 "slice":
                     let start_val = args[0] else Value.Int(0)
                     let end_val = args[1] else Value.Int(s.length)
@@ -1891,7 +1900,31 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 _:
                     throw "unknown method {method_name} on {recv_type}"
 
-        Value.Array(arr):
+        Value.Array(arr_inner):
+            match method_name:
+                "len":
+                    return Value.Int(arr_inner.len())
+                "length":
+                    return Value.Int(arr_inner.len())
+                "isEmpty":
+                    return Value.Bool(arr_inner.len() == 0)
+                "is_empty":
+                    return Value.Bool(arr_inner.len() == 0)
+                "first":
+                    let n = arr_inner.len()
+                    return if n == 0: Value.Nil else: arr_inner.get_at(0)
+                "last":
+                    let n = arr_inner.len()
+                    return if n == 0: Value.Nil else: arr_inner.get_at(n - 1)
+                "get":
+                    let idx_val = args[0] else Value.Int(0)
+                    match idx_val:
+                        Value.Int(i):
+                            let n = arr_inner.len()
+                            return if i >= 0 and i < n: arr_inner.get_at(i) else: Value.Nil
+                        _: throw "get: expected int index"
+                _: nil
+            let arr = arr_inner.clone_elems()
             match method_name:
                 "dedup":
                     mut dd = []
@@ -1900,7 +1933,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         if di == 0 or not values_equal(arr[di], arr[di - 1]):
                             dd.push(arr[di])
                         di = di + 1
-                    Value.Array(dd)
+                    val_array(dd)
                 "swap":
                     let sa = args[0] else Value.Int(0)
                     let sb = args[1] else Value.Int(0)
@@ -1916,7 +1949,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                                     let st_tmp = swapped[si]
                                     swapped[si] = swapped[sj]
                                     swapped[sj] = st_tmp
-                                    Value.Array(swapped)
+                                    val_array(swapped)
                                 _: throw "swap: expected two indices"
                         _: throw "swap: expected two indices"
                 "truncate":
@@ -1928,7 +1961,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             while ti < arr.length and ti < tn:
                                 tr.push(arr[ti])
                                 ti = ti + 1
-                            Value.Array(tr)
+                            val_array(tr)
                         _: throw "truncate: expected a length"
                 "fill":
                     let fv = args[0] else Value.Nil
@@ -1937,7 +1970,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     while fi < arr.length:
                         fl.push(fv)
                         fi = fi + 1
-                    Value.Array(fl)
+                    val_array(fl)
                 "fold":
                     let fold_init = args[0] else Value.Nil
                     let fold_fn = args[1] else Value.Nil
@@ -1948,7 +1981,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         foldi = foldi + 1
                     fold_acc
                 "clear":
-                    Value.Array([])
+                    val_array([])
                 "length":
                     Value.Int(arr.length)
                 "len":
@@ -1956,24 +1989,25 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 "append":
                     let other_val = args[0] else Value.Nil
                     match other_val:
-                        Value.Array(other):
+                        Value.Array(other_inner):
+                            let other = other_inner.clone_elems()
                             var result = arr
                             var i = 0
                             while i < other.length:
                                 result.push(other[i])
                                 i = i + 1
-                            Value.Array(result)
+                            val_array(result)
                         _:
                             var result = arr
                             result.push(other_val)
-                            Value.Array(result)
+                            val_array(result)
                 "collect":
-                    Value.Array(arr)
+                    val_array(arr)
                 "push":
                     let val = args[0] else Value.Nil
                     var result = arr
                     result.push(val)
-                    Value.Array(result)
+                    val_array(result)
                 "pop":
                     if arr.length == 0:
                         Value.Nil
@@ -2000,13 +2034,14 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                                         let item = result[from]
                                         result.remove(from)
                                         result.insert(to, item)
-                                    Value.Array(result)
+                                    val_array(result)
                                 _: throw "move: expected int destination index"
                         _: throw "move: expected int source index"
                 "removeIndices":
                     let indices_val = args[0] else Value.Nil
                     match indices_val:
-                        Value.Array(indices):
+                        Value.Array(indices_inner):
+                            let indices = indices_inner.clone_elems()
                             var previous = -1
                             var i = 0
                             while i < indices.length:
@@ -2028,7 +2063,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                                 else:
                                     result.push(arr[source_idx])
                                 source_idx = source_idx + 1
-                            Value.Array(result)
+                            val_array(result)
                         _: throw "removeIndices: expected an array of indices"
                 "insert":
                     let idx_val = args[0] else Value.Int(0)
@@ -2036,8 +2071,13 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     match idx_val:
                         Value.Int(idx):
                             mut result = arr
-                            result.insert(idx, val)
-                            Value.Array(result)
+                            let clamped = if idx < 0:
+                                let c = result.length + idx
+                                if c < 0: 0 else c
+                            else:
+                                if idx > result.length: result.length else idx
+                            result.insert(clamped, val)
+                            val_array(result)
                         _: throw "insert: expected int index"
                 "first":
                     if arr.length == 0:
@@ -2075,7 +2115,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         let r = call_value(interp, closure, [arr[i]])
                         result.push(r)
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "filter":
                     let closure = args[0] else Value.Nil
                     mut result = []
@@ -2088,7 +2128,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                                     result.push(arr[i])
                             _: throw "filter: predicate must return bool"
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "reduce":
                     let init_val = args[0] else Value.Nil
                     let closure = args[1] else Value.Nil
@@ -2109,7 +2149,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             srtd[sd_b - 1] = sd_tmp
                             sd_b = sd_b - 1
                         sd_a = sd_a + 1
-                    Value.Array(srtd)
+                    val_array(srtd)
                 "sortedBy":
                     let closure = args[0] else Value.Nil
                     mut keys = []
@@ -2133,11 +2173,11 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             sorted_keys[sj - 1] = tmp_k
                             sj = sj - 1
                         si = si + 1
-                    Value.Array(sorted_arr)
+                    val_array(sorted_arr)
                 "reversed":
                     var mut result = arr
                     result = result.reversed()
-                    Value.Array(result)
+                    val_array(result)
                 "any":
                     let closure = args[0] else Value.Nil
                     var found = false
@@ -2185,14 +2225,14 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     match n_val:
                         Value.Int(n):
                             let end = if n < arr.length: n else: arr.length
-                            Value.Array(arr.slice(0, end))
+                            val_array(arr.slice(0, end))
                         _: throw "take: expected int argument"
                 "drop":
                     let n_val = args[0] else Value.Int(0)
                     match n_val:
                         Value.Int(n):
                             let start = if n < arr.length: n else: arr.length
-                            Value.Array(arr.slice(start, arr.length))
+                            val_array(arr.slice(start, arr.length))
                         _: throw "drop: expected int argument"
                 "slice":
                     let start_val = args[0] else Value.Int(0)
@@ -2214,22 +2254,23 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                                     let lo = if start < 0: (len + start).max(0) else: start.min(len)
                                     let hi = if end < 0: (len + end).max(0) else: end.min(len)
                                     if lo >= len or lo >= hi:
-                                        Value.Array([])
+                                        val_array([])
                                     else:
-                                        Value.Array(arr.slice(lo, hi))
+                                        val_array(arr.slice(lo, hi))
                                 _: throw "slice: expected int end"
                         _: throw "slice: expected int start"
                 "zip":
-                    let other_val = args[0] else Value.Array([])
+                    let other_val = args[0] else val_array([])
                     match other_val:
-                        Value.Array(other):
+                        Value.Array(other_inner):
+                            let other = other_inner.clone_elems()
                             mut result = []
                             let len = if arr.length < other.length: arr.length else: other.length
                             var i = 0
                             while i < len:
                                 result.push(Value.Tuple([arr[i], other[i]]))
                                 i = i + 1
-                            Value.Array(result)
+                            val_array(result)
                         _: throw "zip: expected array argument"
                 "enumerate":
                     mut result = []
@@ -2237,7 +2278,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     while i < arr.length:
                         result.push(Value.Tuple([Value.Int(i), arr[i]]))
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "indexOf":
                     let target = args[0] else Value.Nil
                     var found_idx = Value.Nil
@@ -2252,7 +2293,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     var i = 0
                     while i < arr.length:
                         match arr[i]:
-                            Value.Array(inner):
+                            Value.Array(inner_arr):
+                                let inner = inner_arr.clone_elems()
                                 var j = 0
                                 while j < inner.length:
                                     result.push(inner[j])
@@ -2260,7 +2302,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             other:
                                 result.push(other)
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "flatMap":
                     let closure = args[0] else Value.Nil
                     mut result = []
@@ -2268,7 +2310,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     while i < arr.length:
                         let r = call_value(interp, closure, [arr[i]])
                         match r:
-                            Value.Array(inner):
+                            Value.Array(inner_arr):
+                                let inner = inner_arr.clone_elems()
                                 var j = 0
                                 while j < inner.length:
                                     result.push(inner[j])
@@ -2276,7 +2319,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             other:
                                 result.push(other)
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "join":
                     let sep_val = args[0] else Value.Str("")
                     match sep_val:
@@ -2414,7 +2457,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         shuf[si] = shuf[sj]
                         shuf[sj] = tmp
                         si = si - 1
-                    Value.Array(shuf)
+                    val_array(shuf)
                 "sort":
                     mut srt = arr
                     var sa = 1
@@ -2426,7 +2469,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             srt[sb - 1] = stmp
                             sb = sb - 1
                         sa = sa + 1
-                    Value.Array(srt)
+                    val_array(srt)
                 "find":
                     let fpred = args[0] else Value.Nil
                     var fi2 = 0
@@ -2447,7 +2490,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             Value.Bool(true): kept.push(arr[ri])
                             _: nil
                         ri = ri + 1
-                    Value.Array(kept)
+                    val_array(kept)
                 "distinct":
                     mut result = []
                     var i = 0
@@ -2455,7 +2498,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         if not result.contains(arr[i]):
                             result.push(arr[i])
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "isEmpty":
                     Value.Bool(arr.length == 0)
                 "reshape":
@@ -2496,7 +2539,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     # a.flatten() → [T], exact inverse of .reshape() — drops
                     # the shape, keeps the same underlying elements
                     # (docs/array-multidim-types.md).
-                    Value.Array(arr)
+                    val_array(arr)
                 _:
                     throw "unknown method {method_name} on {recv_type}"
 
@@ -2519,7 +2562,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                             found = pair.1
                         i = i + 1
                     found
-                "set":
+                "set" | "put" | "insert":
                     let key = args[0] else Value.Nil
                     let val = args[1] else Value.Nil
                     var new_pairs = pairs
@@ -2584,22 +2627,22 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     while i < pairs.length:
                         result.push(pairs[i].0)
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "values":
                     mut result = []
                     var i = 0
                     while i < pairs.length:
                         result.push(pairs[i].1)
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "entries":
                     mut result = []
                     var i = 0
                     while i < pairs.length:
                         let (ek, ev) = pairs[i]
-                        result.push(Value.Array([ek, ev]))
+                        result.push(val_array([ek, ev]))
                         i = i + 1
-                    Value.Array(result)
+                    val_array(result)
                 "merge":
                     let other_val = args[0] else Value.Dict([])
                     match other_val:
@@ -2707,7 +2750,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                         i = i + 1
                     Value.Set(result)
                 "toArray":
-                    Value.Array(elements)
+                    val_array(elements)
                 # union/intersection/difference are all O(n·m): each calls
                 # `.contains()` (a linear scan) once per element of `elements`.
                 # Inherent to Set being a plain `[Value]`, not a hash table —
@@ -2717,7 +2760,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let other_val = args[0] else Value.Set([])
                     let other = match other_val:
                         Value.Set(s): s
-                        Value.Array(a): a
+                        Value.Array(a): a.clone_elems()
                         _: throw "union: expected set or array"
                     var result = elements
                     var i = 0
@@ -2730,7 +2773,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let other_val = args[0] else Value.Set([])
                     let other = match other_val:
                         Value.Set(s): s
-                        Value.Array(a): a
+                        Value.Array(a): a.clone_elems()
                         _: throw "intersection: expected set or array"
                     mut result = []
                     var i = 0
@@ -2743,7 +2786,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let other_val = args[0] else Value.Set([])
                     let other = match other_val:
                         Value.Set(s): s
-                        Value.Array(a): a
+                        Value.Array(a): a.clone_elems()
                         _: throw "difference: expected set or array"
                     mut result = []
                     var i = 0
@@ -2756,7 +2799,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let other_val = args[0] else Value.Set([])
                     let other = match other_val:
                         Value.Set(s): s
-                        Value.Array(a): a
+                        Value.Array(a): a.clone_elems()
                         _: throw "isSubset: expected set or array"
                     var all_in = true
                     var i = 0
@@ -2769,7 +2812,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     let other_val = args[0] else Value.Set([])
                     let other = match other_val:
                         Value.Set(s): s
-                        Value.Array(a): a
+                        Value.Array(a): a.clone_elems()
                         _: throw "isSuperset: expected set or array"
                     var all_in = true
                     var i = 0
@@ -2810,6 +2853,10 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Int(n)
                 "toStr":
                     Value.Str("{n}")
+                "toString":
+                    Value.Str("{n}")
+                "to_string":
+                    Value.Str("{n}")
                 "toBin":
                     Value.Str("{n:b}")
                 "toHex":
@@ -2831,6 +2878,10 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     Value.Uint(n)
                 "toStr":
                     Value.Str("{n}")
+                "toString":
+                    Value.Str("{n}")
+                "to_string":
+                    Value.Str("{n}")
                 "toBin":
                     Value.Str("{n:b}")
                 "toHex":
@@ -2851,6 +2902,10 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 "round":
                     Value.Uint8(n)
                 "toStr":
+                    Value.Str("{n}")
+                "toString":
+                    Value.Str("{n}")
+                "to_string":
                     Value.Str("{n}")
                 "toBin":
                     Value.Str("{n:b}")
@@ -3143,7 +3198,7 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     while i < lim:
                         result.push(Value.Int(i))
                         i = i + step
-                    Value.Array(result)
+                    val_array(result)
                 "contains":
                     let val = args[0] else Value.Nil
                     match val:
@@ -3197,6 +3252,8 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                     throw "unknown method {method_name} on tuple"
 
         Value.Object(inner):
+            if let ecs_res = handle_ecs_object_method(interp, inner, method_name, args):
+                return ecs_res
             # Channel TX send method
             if inner.type_name == "__ChannelTx__" and method_name == "send":
                 let ch_id_opt = inner.get_field("__ch_id__")
@@ -3291,18 +3348,22 @@ def Value call_method(mut Interpreter interp, Value recv, string method_name, [V
                 let method_scope = interp.current_env
                 capture_var_param_outs(interp, method_params, method_scope)
                 if mutating:
-                    for field in inner.fields:
-                        let updated = interp.current_env.get(field.0)
+                    let field_names = inner.fields.map((f): f.0)
+                    mut ObjectInner'actor oi = inner
+                    for fname in field_names:
+                        let updated = interp.current_env.get(fname.clone())
                         if let v = updated:
-                            inner.set_field(field.0, v)
+                            oi.set_field(fname, v)
                 else:
                     # `req` method writing an `'actor`/`'guard` field (e.g. `memo[k] = w`).
                     let shared_fields = interior_mutable_fields(interp, type_name.clone())
-                    for field in inner.fields:
-                        if shared_fields.contains(field.0):
-                            let updated = interp.current_env.get(field.0)
+                    let field_names = inner.fields.map((f): f.0)
+                    mut ObjectInner'actor oi = inner
+                    for fname in field_names:
+                        if shared_fields.contains(fname):
+                            let updated = interp.current_env.get(fname.clone())
                             if let v = updated:
-                                inner.set_field(field.0, v)
+                                oi.set_field(fname, v)
                 view_sync(interp, self_val.clone(), true, 1)
                 if let vs2 = view_state_opt:
                     view_sync(interp, vs2, false, 1)

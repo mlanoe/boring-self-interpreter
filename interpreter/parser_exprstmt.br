@@ -609,14 +609,24 @@ def Expr parse_postfix_inner(mut Parser p, bool allow_chain) throws:
                 else:
                     let inner = parse_expr(p)
                     # parse_expr may have consumed M..<N as Range — convert to SliceRange
-                    # M.. (open-ended) is caught by the DotDot postfix arm below
-                    match inner.kind:
-                        ExprKind.Range(start, end, inclusive):
-                            make_slice_range(start, end, inclusive, line)
-                        ExprKind.SliceRange(s, e, inc):
-                            inner
-                        _:
-                            inner
+                    # M.. or M..= (open-ended with compound start like i+1..) is caught right here
+                    if parser_check(p, "DotDot"):
+                        parser_advance(p)
+                        if parser_check(p, "RBracket"):
+                            make_slice_range(inner, make_hole(line), false, line)
+                        else:
+                            throw "exclusive slice is now `x..<y`, not `x..y` — use `..<` instead of bare `..`"
+                    elif parser_check(p, "DotDotEq") and parser_token_at_offset_is(p, 1, "RBracket"):
+                        parser_advance(p)
+                        make_slice_range(inner, make_hole(line), true, line)
+                    else:
+                        match inner.kind:
+                            ExprKind.Range(start, end, inclusive):
+                                make_slice_range(start, end, inclusive, line)
+                            ExprKind.SliceRange(s, e, inc):
+                                inner
+                            _:
+                                inner
                 parser_expect(p, "RBracket")
                 expr = make_index(expr, idx, line)
         elif parser_check(p, "LParen"):
@@ -660,28 +670,20 @@ def Expr parse_postfix_inner(mut Parser p, bool allow_chain) throws:
                 let ty = parse_type(p)
                 expr = make_cast(expr, ty, line)
         elif parser_check(p, "DotDotLt") or parser_check(p, "DotDotEq"):
+            if parser_check(p, "DotDotEq") and parser_token_at_offset_is(p, 1, "RBracket"):
+                break
             let inclusive = parser_check(p, "DotDotEq")
             parser_advance(p)
-            # a[M..=] — open-ended inclusive slice (next token is `]`).
-            # (`M..<` has no open-ended form — `..<` always requires an explicit end.)
-            if inclusive and parser_check(p, "RBracket"):
-                expr = make_slice_range(expr, make_hole(line), inclusive, line)
-            else:
-                # The endpoint may itself use postfix field/index access
-                # (`a[0..<cursor.pos]`). Parsing only a primary leaves `.pos`
-                # attached to the range expression instead of its endpoint.
-                let end = parse_postfix_inner(p, false)
-                expr = make_range(expr, end, inclusive, line)
+            # The endpoint may itself use postfix field/index access
+            # (`a[0..<cursor.pos]`). Parsing only a primary leaves `.pos`
+            # attached to the range expression instead of its endpoint.
+            let end = parse_postfix_inner(p, false)
+            expr = make_range(expr, end, inclusive, line)
         elif parser_check(p, "DotDot"):
-            # Bare `..` is only still legal as the open-ended slice M.. — the
-            # exclusive-with-endpoint form was renamed to `..<` (no alias kept
-            # for the old spelling, matching the ownership-qualifier rename
-            # precedent).
-            parser_advance(p)
-            if parser_check(p, "RBracket"):
-                expr = make_slice_range(expr, make_hole(line), false, line)
-            else:
-                throw "exclusive range is now `x..<y`, not `x..y` — use `..<` instead of bare `..`"
+            # Bare `..` is only legal as an open-ended slice M.. inside `[...]` — handled in Index.
+            if parser_token_at_offset_is(p, 1, "RBracket"):
+                break
+            throw "exclusive range is now `x..<y`, not `x..y` — use `..<` instead of bare `..`"
         elif parser_peek_is_ident(p) and parser_peek_is_trailing_closure_no_paren(p):
             let args = parse_trailing_closure_no_paren(p, [])
             seen_trailing_closure = true
@@ -738,6 +740,18 @@ def Expr parse_primary(mut Parser p) throws:
     if parser_check(p, "SelfKw"):
         parser_advance(p)
         return make_var_expr("self", line)
+    if parser_check(p, "Kernel"):
+        if parser_peek_next_is(p, "Dot"):
+            parser_advance(p)
+            return make_var_expr("kernel", line)
+        if parser_peek_next_is(p, "LParen"):
+            parser_advance(p)
+            let _ = parse_call_args(p)
+            parser_expect(p, "Colon")
+            parser_expect_newline(p)
+            let body = parse_block(p)
+            check_no_return(body, "inline kernel")
+            return make_block_expr(body, line)
     if parser_peek_is_ident(p):
         let name = parser_peek_ident(p)
         if name == "query":
@@ -798,23 +812,64 @@ def Expr parse_primary(mut Parser p) throws:
                 var Expr? projection = nil
                 if parser_check(p, "PipeArrow"):
                     var next_is_collect = false
-                    if p.pos + 1 < p.tokens.length:
-                        match p.tokens[p.pos + 1].kind:
-                            TokenKind.Ident(id):
-                                if id == "collect":
-                                    next_is_collect = true
-                            TokenKind.Dot:
-                                if p.pos + 2 < p.tokens.length:
-                                    match p.tokens[p.pos + 2].kind:
-                                        TokenKind.Ident(id2):
-                                            if id2 == "collect":
-                                                next_is_collect = true
-                                        _: nil
-                            _: nil
+                    let t1 = parser_peek_token_at(p, 1)
+                    match t1.kind:
+                        TokenKind.Ident(id):
+                            if id == "collect":
+                                next_is_collect = true
+                        TokenKind.Dot:
+                            let t2 = parser_peek_token_at(p, 2)
+                            match t2.kind:
+                                TokenKind.Ident(id2):
+                                    if id2 == "collect":
+                                        next_is_collect = true
+                                _: nil
+                        _: nil
                     if not next_is_collect:
                         _ = parser_advance(p)
                         projection = parse_or(p)
                 return make_query_expr(kind, is_optional, vars, iterable, where_clause, projection, line)
+            else:
+                let t1_kind = token_kind_name(parser_peek_token_at(p, 1).kind)
+                let sub_check = match parser_peek_token_at(p, 1).kind:
+                    TokenKind.Ident(s): s
+                    _: ""
+                if sub_check == "all" or sub_check == "single" or sub_check == "first" or sub_check == "any" or t1_kind == "LParen":
+                    _ = parser_advance(p)
+                    var kind = QueryKind.All
+                    var is_optional = false
+                    if t1_kind != "LParen":
+                        let sub = parser_peek_ident(p)
+                        if sub == "all":
+                            _ = parser_advance(p)
+                            kind = QueryKind.All
+                        elif sub == "single":
+                            _ = parser_advance(p)
+                            is_optional = parser_eat(p, "Question")
+                            kind = QueryKind.Single
+                        elif sub == "first":
+                            _ = parser_advance(p)
+                            is_optional = parser_eat(p, "Question")
+                            kind = QueryKind.First
+                        elif sub == "any":
+                            _ = parser_advance(p)
+                            is_optional = parser_eat(p, "Question")
+                            kind = QueryKind.Any
+                    mut [EcsFetchComponent] components = []
+                    if parser_eat(p, "LParen"):
+                        while not parser_check(p, "RParen") and not parser_check(p, "Eof"):
+                            let is_mut = parser_eat(p, "Mut")
+                            let ty = parse_type(p)
+                            let is_opt = ecs_is_optional_type(ty.clone())
+                            let base_name = ecs_type_base_name(ty) else ""
+                            components.push(EcsFetchComponent(type_name= base_name, is_mut= is_mut, is_option= is_opt))
+                            if not parser_eat(p, "Comma"):
+                                break
+                        parser_expect(p, "RParen")
+                    var [{string=string}] where_clause = []
+                    if parser_eat(p, "Where"):
+                        where_clause = parse_query_where_clause(p)
+                    return make_ecs_fetch_expr(kind, is_optional, components, where_clause, line)
         if parser_peek_is_macro_call(p):
             parser_advance(p)
             parser_advance(p)
@@ -1518,7 +1573,7 @@ def Stmt parse_stmt(mut Parser p) throws:
             return stmt_enum(parse_enum_decl(p, true))
         else:
             return stmt_fn(parse_fn_decl(p, true, true))
-    if parser_check(p, "Kernel"):
+    if parser_check(p, "Kernel") and not parser_peek_next_is(p, "LParen") and not parser_peek_next_is(p, "Dot"):
         let kline = parser_line(p)
         parser_advance(p)
         # `kernel Name:` → struct declaration (skip here); `kernel:` / `kernel expr` → block
@@ -1835,12 +1890,67 @@ def WhileStmt parse_while_stmt(mut Parser p) throws:
         parse_block(p)
     make_while_stmt(condition, body, line)
 
+def bool parser_is_ecs_for(mut Parser p) throws:
+    var i = 0
+    while i < 120:
+        let k = token_kind_name(parser_peek_token_at(p, i).kind)
+        if k == "In":
+            return false
+        if k == "Colon" or k == "Where" or k == "Newline" or k == "Eof":
+            break
+        i = i + 1
+    if parser_check(p, "Mut") or parser_is_type_start_before_ident(p):
+        return true
+    if parser_peek_is_ident(p):
+        let k1 = token_kind_name(parser_peek_token_at(p, 1).kind)
+        if k1 == "Comma":
+            return true
+    false
+
 def ForStmt parse_for_stmt(mut Parser p) throws:
     let line = parser_line(p)
     parser_expect(p, "For")
     let saved = parser_get_allow_noparen_closure(p)
     parser_set_allow_noparen_closure(p, false)
     parser_set_allow_trailing_closure(p, false)
+    if parser_is_ecs_for(p):
+        mut [string] ecs_vars = []
+        mut [string?] ecs_types = []
+        mut [bool] ecs_muts = []
+        mut [bool] ecs_options = []
+        while true:
+            let is_mut = parser_eat(p, "Mut")
+            if is_mut or parser_is_type_start_before_ident(p):
+                let ty = parse_type(p)
+                let is_opt = ecs_is_optional_type(ty.clone())
+                let base_name = ecs_type_base_name(ty)
+                let vname = parser_expect_ident(p)
+                ecs_vars.push(vname)
+                ecs_types.push(base_name)
+                ecs_muts.push(is_mut)
+                ecs_options.push(is_opt)
+            else:
+                let vname = parser_expect_ident(p)
+                ecs_vars.push(vname)
+                ecs_types.push(nil)
+                ecs_muts.push(false)
+                ecs_options.push(false)
+            if not parser_eat(p, "Comma"):
+                break
+        parser_set_allow_noparen_closure(p, saved)
+        parser_set_allow_trailing_closure(p, true)
+        var [{string=string}] ecs_where = []
+        if parser_eat(p, "Where"):
+            ecs_where = parse_query_where_clause(p)
+        parser_expect(p, "Colon")
+        let body = if not parser_is_newline(p) and not parser_check(p, "Eof"):
+            let stmts = parse_inline_stmts(p)
+            parser_expect_newline_soft(p)
+            stmts
+        else:
+            parser_expect_newline(p)
+            parse_block(p)
+        return make_ecs_for_stmt(ecs_vars, ecs_types, ecs_muts, ecs_options, ecs_where, body, line)
     let vars_iterable = if parser_is_for_with_vars(p):
         mut vars = [parser_expect_ident(p)]
         while parser_eat(p, "Comma"):

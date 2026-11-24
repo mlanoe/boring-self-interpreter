@@ -1,0 +1,1132 @@
+# Copyright (C) 2026 Mickaël LANOË
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# == BORING ECS RUNTIME ==
+#
+# In-memory ECS world, query engine, command buffer, and game loop for the
+# self-hosted interpreter, matching `boring/src/interpreter/ecs.rs`.
+
+struct EcsState:
+    var int next_id = 0
+    var int tick = 1
+    var [int] generations = []
+    var [bool] alive = []
+    var [{string=Value}] components = []
+    var [{string=int}] added_ticks = []
+    var [{string=int}] changed_ticks = []
+    var [int] free_ids = []
+    var {string=Value} resources = {=}
+    var {string=[string]} component_requires = {=}
+    var {string=StructDecl} component_decls = {=}
+    var [int] pending_despawns = []
+    var bool has_current_entity = false
+    var int current_entity_id = 0
+    var int current_entity_gen = 0
+    var float time_delta = 0.016
+    var float time_elapsed = 0.0
+    var {string=[FnDecl]} observers = {=}
+    var bool active = false
+
+    req bool is_active():
+        active
+
+    def void set_active(bool v):
+        active = v
+
+    req Value make_entity_val(int idx):
+        let gen = if idx >= 0 and idx < generations.length: generations[idx] else: 0
+        Value.Object(ObjectInner(type_name= "Entity", fields= [("id", Value.Int(idx)), ("generation", Value.Int(gen))]))
+
+    req Value? get_current_entity_val():
+        if not has_current_entity:
+            return nil
+        Value.Object(ObjectInner(type_name= "Entity", fields= [("id", Value.Int(current_entity_id)), ("generation", Value.Int(current_entity_gen))]))
+
+    def void set_current_entity(bool present, int id, int gen):
+        has_current_entity = present
+        current_entity_id = id
+        current_entity_gen = gen
+
+    req (bool, int, int) save_current_entity():
+        (has_current_entity, current_entity_id, current_entity_gen)
+
+    def void register_component_decl(string name, StructDecl decl, [string] reqs):
+        component_decls.set(name.clone(), decl)
+        if reqs.length > 0:
+            component_requires.set(name, reqs)
+
+    req [string] get_requires(string name):
+        if component_requires.has(name):
+            return component_requires[name]
+        []
+
+    req StructDecl? get_component_decl(string name):
+        if component_decls.has(name):
+            return component_decls[name]
+        nil
+
+    def void set_resource(string name, Value val):
+        resources.set(name, val)
+
+    req bool has_resource(string name):
+        resources.has(name)
+
+    req Value? get_resource(string name):
+        if resources.has(name):
+            return resources[name]
+        nil
+
+    def void remove_resource(string name):
+        _ = resources.remove(name)
+
+    req [(string, Value)] all_resources():
+        mut [(string, Value)] out = []
+        for k, v in resources:
+            out.push((k, v))
+        out
+
+    def Value spawn_entity([(string, Value)] comps):
+        var int idx = 0
+        if free_ids.length > 0:
+            idx = free_ids[free_ids.length - 1]
+            free_ids.remove(free_ids.length - 1)
+            alive[idx] = true
+            components[idx] = {=}
+            added_ticks[idx] = {=}
+            changed_ticks[idx] = {=}
+        else:
+            idx = next_id
+            next_id = next_id + 1
+            generations.push(0)
+            alive.push(true)
+            components.push({=})
+            added_ticks.push({=})
+            changed_ticks.push({=})
+        for pair in comps:
+            let ty = pair.0
+            let val = pair.1
+            mut {string=Value} cmap = components[idx]
+            cmap.set(ty.clone(), val)
+            components[idx] = cmap
+            mut {string=int} amap = added_ticks[idx]
+            amap.set(ty.clone(), tick)
+            added_ticks[idx] = amap
+            mut {string=int} chmap = changed_ticks[idx]
+            chmap.set(ty, tick)
+            changed_ticks[idx] = chmap
+        let gen = generations[idx]
+        Value.Object(ObjectInner(type_name= "Entity", fields= [("id", Value.Int(idx)), ("generation", Value.Int(gen))]))
+
+    def void insert_component(int idx, string ty, Value val):
+        if idx < 0 or idx >= alive.length or not alive[idx]:
+            return
+        mut {string=Value} cmap = components[idx]
+        let already = cmap.has(ty.clone())
+        cmap.set(ty.clone(), val)
+        components[idx] = cmap
+        if not already:
+            mut {string=int} amap = added_ticks[idx]
+            amap.set(ty.clone(), tick)
+            added_ticks[idx] = amap
+        mut {string=int} chmap = changed_ticks[idx]
+        chmap.set(ty, tick)
+        changed_ticks[idx] = chmap
+
+    def void remove_component(int idx, string ty):
+        if idx < 0 or idx >= alive.length or not alive[idx]:
+            return
+        mut {string=Value} cmap = components[idx]
+        _ = cmap.remove(ty.clone())
+        components[idx] = cmap
+        mut {string=int} amap = added_ticks[idx]
+        _ = amap.remove(ty.clone())
+        added_ticks[idx] = amap
+        mut {string=int} chmap = changed_ticks[idx]
+        _ = chmap.remove(ty)
+        changed_ticks[idx] = chmap
+
+    req bool entity_has_component(int idx, string ty):
+        if idx < 0 or idx >= alive.length or not alive[idx]:
+            return false
+        let {string=Value} cmap = components[idx]
+        cmap.has(ty)
+
+    req Value? get_component(int idx, string ty):
+        if idx < 0 or idx >= alive.length or not alive[idx]:
+            return nil
+        let {string=Value} cmap = components[idx]
+        if cmap.has(ty.clone()):
+            return cmap[ty]
+        nil
+
+    def void mark_changed(int idx, string ty):
+        if idx < 0 or idx >= alive.length or not alive[idx]:
+            return
+        mut {string=int} chmap = changed_ticks[idx]
+        chmap.set(ty, tick)
+        changed_ticks[idx] = chmap
+
+    def void despawn_entity(int idx):
+        if idx >= 0 and idx < alive.length and alive[idx]:
+            alive[idx] = false
+            generations[idx] = generations[idx] + 1
+            components[idx] = {=}
+            added_ticks[idx] = {=}
+            changed_ticks[idx] = {=}
+            free_ids.push(idx)
+
+    def void queue_despawn(int idx):
+        if not pending_despawns.contains(idx):
+            pending_despawns.push(idx)
+
+    def void apply_commands():
+        let to_despawn = pending_despawns
+        pending_despawns = []
+        for idx in to_despawn:
+            self.despawn_entity(idx)
+
+    req [int] query_entities([string] with_types, [string] without_types, [string] added_types, [string] changed_types):
+        mut [int] out = []
+        var int idx = 0
+        while idx < alive.length:
+            if alive[idx]:
+                let {string=Value} cmap = components[idx]
+                var bool ok = true
+                for wt in with_types:
+                    if not cmap.has(wt):
+                        ok = false
+                        break
+                if ok:
+                    for wot in without_types:
+                        if cmap.has(wot):
+                            ok = false
+                            break
+                if ok:
+                    let {string=int} amap = added_ticks[idx]
+                    for at in added_types:
+                        if not amap.has(at.clone()) or amap[at] != tick:
+                            ok = false
+                            break
+                if ok:
+                    let {string=int} chmap = changed_ticks[idx]
+                    for ct in changed_types:
+                        if not chmap.has(ct.clone()) or chmap[ct] != tick:
+                            ok = false
+                            break
+                if ok:
+                    out.push(idx)
+            idx = idx + 1
+        out
+
+    def void advance_tick():
+        tick = tick + 1
+        time_elapsed = time_elapsed + time_delta
+
+    req (float, float) get_time():
+        (time_delta, time_elapsed)
+
+    def void clear_observers():
+        observers = {=}
+
+    def void add_observer(string ev_name, FnDecl fn_decl):
+        mut list = if observers.has(ev_name.clone()): observers[ev_name.clone()] else: [FnDecl]{}
+        list.push(fn_decl)
+        observers.set(ev_name, list)
+
+    req [FnDecl] get_observers(string ev_name):
+        if observers.has(ev_name):
+            return observers[ev_name]
+        []
+
+def EcsState'actor new_ecs_state():
+    EcsState(
+        next_id= 0,
+        tick= 1,
+        generations= [],
+        alive= [],
+        components= [],
+        added_ticks= [],
+        changed_ticks= [],
+        free_ids= [],
+        resources= {=},
+        component_requires= {=},
+        component_decls= {=},
+        pending_despawns= [],
+        has_current_entity= false,
+        current_entity_id= 0,
+        current_entity_gen= 0,
+        time_delta= 0.016,
+        time_elapsed= 0.0,
+        observers= {=},
+        active= false
+    )
+
+# ─── ECS AST & Filter Helpers ─────────────────────────────────────────────────
+
+def bool ecs_attrs_have([Attr] attrs, string name):
+    for a in attrs:
+        if a.name.toLower() == name:
+            return true
+    false
+
+def bool ecs_fn_has_schedule_attr(FnDecl f):
+    for a in f.attrs:
+        let low = a.name.toLower()
+        if low == "schedule" or low == "startup" or low == "update" or low == "fixedupdate" or low == "fixed_update" or low == "postupdate" or low == "post_update" or low == "observer" or low == "observe" or low == "after" or low == "before" or low == "chain" or low == "state" or low == "instate" or low == "in_state":
+            return true
+    false
+
+def string? ecs_observer_event_name(FnDecl f):
+    if f.params.length == 0:
+        return nil
+    if let ty = f.params[0].ty:
+        match ty:
+            Type.Generic(g, args):
+                if (g == "On" or g == "Trigger") and args.length == 1:
+                    return ecs_type_base_name(args[0])
+            Type.Named(n):
+                if n.startsWith("On<") and n.endsWith(">"):
+                    return n.slice(3, n.length - 1).trim()
+                if n.startsWith("Trigger<") and n.endsWith(">"):
+                    return n.slice(8, n.length - 1).trim()
+            _: nil
+    nil
+
+def bool ecs_fn_uses_ecs(FnDecl f):
+    if f.where_clause.length > 0 or ecs_fn_has_schedule_attr(f) or ecs_observer_event_name(f) != nil:
+        return true
+    ecs_stmts_use_ecs(f.body)
+
+def bool ecs_expr_uses_ecs(Expr expr):
+    match expr.kind:
+        ExprKind.EcsFetch(_): true
+        ExprKind.If(ifs):
+            for br in ifs.branches:
+                if ecs_expr_uses_ecs(br.cond) or ecs_stmts_use_ecs(br.body):
+                    return true
+            if let eb = ifs.else_body:
+                return ecs_stmts_use_ecs(eb)
+            false
+        ExprKind.Block(stmts): ecs_stmts_use_ecs(stmts)
+        ExprKind.Do(stmts): ecs_stmts_use_ecs(stmts)
+        _: false
+
+def bool ecs_stmt_uses_ecs(Stmt stmt):
+    match stmt:
+        Stmt.For(fs):
+            if fs.ecs_types.length > 0 or fs.ecs_where.length > 0:
+                return true
+            ecs_stmts_use_ecs(fs.body)
+        Stmt.If(ifs):
+            for br in ifs.branches:
+                if ecs_expr_uses_ecs(br.cond) or ecs_stmts_use_ecs(br.body):
+                    return true
+            if let eb = ifs.else_body:
+                return ecs_stmts_use_ecs(eb)
+            false
+        Stmt.While(ws): ecs_expr_uses_ecs(ws.condition) or ecs_stmts_use_ecs(ws.body)
+        Stmt.Match(ms):
+            for arm in ms.arms:
+                match arm.body:
+                    MatchBody.Expr(e):
+                        if ecs_expr_uses_ecs(e):
+                            return true
+                    MatchBody.Block(b):
+                        if ecs_stmts_use_ecs(b):
+                            return true
+            false
+        Stmt.Let(ls):
+            if let lv = ls.value:
+                return ecs_expr_uses_ecs(lv)
+            false
+        Stmt.Expr(e): ecs_expr_uses_ecs(e)
+        Stmt.Return(rs):
+            if let v = rs.value:
+                return ecs_expr_uses_ecs(v)
+            false
+        _: false
+
+def bool ecs_stmts_use_ecs([Stmt] stmts):
+    for s in stmts:
+        if ecs_stmt_uses_ecs(s):
+            return true
+    false
+
+def bool program_uses_ecs(Program prog):
+    for item in prog.items:
+        match item:
+            Item.Struct(s):
+                if ecs_attrs_have(s.attrs, "component") or ecs_attrs_have(s.attrs, "resource") or ecs_attrs_have(s.attrs, "game"):
+                    return true
+                for m in s.methods:
+                    if ecs_fn_uses_ecs(m):
+                        return true
+            Item.Fn(f):
+                if ecs_fn_uses_ecs(f):
+                    return true
+            Item.Stmt(s):
+                if ecs_stmt_uses_ecs(s):
+                    return true
+            _: nil
+    false
+
+def void ecs_extract_where_filters([{string=string}] where_clause, mut [string] with_types, mut [string] without_types, mut [string] added_types, mut [string] changed_types):
+    for term in where_clause:
+        let {string=string} tmap = term
+        let kind = tmap["kind"] else ""
+        let name = tmap["name"] else ""
+        if name.length == 0:
+            continue
+        if kind == "With":
+            with_types.push(name)
+        elif kind == "Without":
+            without_types.push(name)
+        elif kind == "Added":
+            with_types.push(name)
+            added_types.push(name)
+        elif kind == "Changed":
+            with_types.push(name)
+            changed_types.push(name)
+
+# ─── Resource & Component Initialization ───────────────────────────────────────
+
+def void init_ecs_resources(mut Interpreter interp, Program prog):
+    mut ecs = interp.ecs
+    ecs.set_active(true)
+    if not ecs.has_resource("Time"):
+        ecs.set_resource("Time", Value.Object(ObjectInner(type_name= "Time", fields= [("delta", Value.Float64(0.016)), ("elapsed", Value.Float64(0.0))])))
+    if not ecs.has_resource("ButtonInput"):
+        ecs.set_resource("ButtonInput", Value.Object(ObjectInner(type_name= "ButtonInput", fields= [("pressed", Value.Set([])), ("just_pressed", Value.Set([])), ("just_released", Value.Set([]))])))
+    for item in prog.items:
+        match item:
+            Item.Struct(s):
+                if ecs_attrs_have(s.attrs, "component"):
+                    mut [string] reqs = []
+                    for a in s.attrs:
+                        if a.name.toLower() == "require":
+                            for arg in a.args:
+                                reqs.push(arg)
+                    ecs.register_component_decl(s.name, s, reqs)
+                elif ecs_attrs_have(s.attrs, "resource") or ecs_attrs_have(s.attrs, "game"):
+                    let inst = instantiate_struct(interp, s, [])
+                    ecs.set_resource(s.name, inst)
+                for m in s.methods:
+                    ecs_init_state_from_attrs(interp, m.attrs)
+            Item.Fn(f):
+                ecs_init_state_from_attrs(interp, f.attrs)
+            _: nil
+
+def void ecs_init_state_from_attrs(mut Interpreter interp, [Attr] attrs):
+    mut ecs = interp.ecs
+    for a in attrs:
+        let low = a.name.toLower()
+        if low == "state" or low == "instate" or low == "in_state":
+            for arg in a.args:
+                let parts = arg.replace(":", ".").split(".")
+                if parts.length == 2:
+                    let enum_name = parts[0].trim()
+                    if enum_name.length > 0 and not ecs.has_resource(enum_name.clone()):
+                        if let edecl = interp.get_enum_decl(enum_name.clone()):
+                            if edecl.variants.length > 0:
+                                ecs.set_resource(enum_name.clone(), Value.EnumVariant(enum_name, edecl.variants[0].name, []))
+
+# ─── Component @require Expansion ─────────────────────────────────────────────
+
+def void ecs_collect_spawn_components(mut Interpreter interp, Value bundle_val, mut [(string, Value)] out):
+    match bundle_val:
+        Value.Tuple(elems):
+            for elem in elems:
+                ecs_collect_spawn_components(interp, elem, out)
+        Value.Object(obj):
+            let tname = obj.type_name
+            out.push((tname, bundle_val))
+        _: nil
+
+def void ecs_append_required_components(mut Interpreter interp, string comp_name, mut [(string, Value)] pairs, mut [string] seen):
+    if seen.contains(comp_name):
+        return
+    seen.push(comp_name.clone())
+    mut ecs = interp.ecs
+    let reqs = ecs.get_requires(comp_name)
+    for req_name in reqs:
+        var bool already = false
+        for p in pairs:
+            if p.0 == req_name:
+                already = true
+                break
+        if not already:
+            if let decl = ecs.get_component_decl(req_name.clone()):
+                let inst = instantiate_struct(interp, decl, [])
+                pairs.push((req_name.clone(), inst))
+        ecs_append_required_components(interp, req_name, pairs, seen)
+
+def Value ecs_spawn_with_requires(mut Interpreter interp, Value bundle_val):
+    mut [(string, Value)] pairs = []
+    ecs_collect_spawn_components(interp, bundle_val, pairs)
+    mut [string] initial_names = []
+    for p in pairs:
+        initial_names.push(p.0)
+    mut [string] seen = []
+    for nm in initial_names:
+        ecs_append_required_components(interp, nm, pairs, seen)
+    mut ecs = interp.ecs
+    let ent = ecs.spawn_entity(pairs)
+    var int eid = 0
+    var int egen = 0
+    match ent:
+        Value.Object(eo):
+            for f in eo.fields:
+                if f.0 == "id":
+                    match f.1:
+                        Value.Int(n): eid = n
+                        _: nil
+                elif f.0 == "generation":
+                    match f.1:
+                        Value.Int(n): egen = n
+                        _: nil
+        _: nil
+    Value.Object(ObjectInner(type_name= "__BoringEcsEntityCommands", fields= [("id", Value.Int(eid)), ("generation", Value.Int(egen))]))
+
+# ─── Query & For Execution ────────────────────────────────────────────────────
+
+def Value ecs_project_fetch_component(EcsState'actor ecs, int idx, EcsFetchComponent comp):
+    if comp.type_name == "Entity":
+        return ecs.make_entity_val(idx)
+    if let v = ecs.get_component(idx, comp.type_name):
+        return v
+    Value.Nil
+
+def Value eval_ecs_fetch(mut Interpreter interp, EcsFetchExpr f, int line):
+    mut [string] with_types = []
+    mut [string] without_types = []
+    mut [string] added_types = []
+    mut [string] changed_types = []
+    for comp in f.components:
+        if not comp.is_option and comp.type_name.length > 0 and comp.type_name != "Entity":
+            with_types.push(comp.type_name)
+    ecs_extract_where_filters(f.where_clause, with_types, without_types, added_types, changed_types)
+    mut ecs = interp.ecs
+    let matching = ecs.query_entities(with_types, without_types, added_types, changed_types)
+    match f.kind:
+        QueryKind.Any:
+            if f.components.length == 0:
+                return Value.Bool(matching.length > 0)
+        _: nil
+    mut [Value] projected = []
+    for idx in matching:
+        if f.components.length == 1:
+            projected.push(ecs_project_fetch_component(ecs, idx, f.components[0]))
+        else:
+            mut [Value] tup = []
+            for c in f.components:
+                tup.push(ecs_project_fetch_component(ecs, idx, c))
+            projected.push(Value.Tuple(tup))
+        match f.kind:
+            QueryKind.First | QueryKind.Any:
+                break
+            QueryKind.Single:
+                if projected.length > 1:
+                    throw "query single: expected at most one matching entity, found multiple"
+            _: nil
+    match f.kind:
+        QueryKind.All:
+            val_array(projected)
+        QueryKind.First | QueryKind.Any:
+            if projected.length > 0:
+                return projected[0]
+            if f.is_optional:
+                return Value.Nil
+            throw "query first: no matching entity found"
+        QueryKind.Single:
+            if projected.length == 1:
+                return projected[0]
+            if projected.length == 0:
+                if f.is_optional:
+                    return Value.Nil
+                throw "query single: no matching entity found"
+            throw "query single: expected at most one matching entity, found multiple"
+
+def Signal? exec_ecs_for(mut Interpreter interp, ForStmt fs):
+    mut [string] with_types = []
+    mut [string] without_types = []
+    mut [string] added_types = []
+    mut [string] changed_types = []
+    var int ti = 0
+    while ti < fs.ecs_types.length:
+        let is_opt = if ti < fs.ecs_options.length: fs.ecs_options[ti] else: false
+        if not is_opt:
+            if let tname = fs.ecs_types[ti]:
+                if tname != "Entity":
+                    with_types.push(tname)
+        ti = ti + 1
+    ecs_extract_where_filters(fs.ecs_where, with_types, without_types, added_types, changed_types)
+    mut ecs = interp.ecs
+    let matching = ecs.query_entities(with_types, without_types, added_types, changed_types)
+    let prev = ecs.save_current_entity()
+    let outer_env = interp.current_env
+    for idx in matching:
+        let ent_val = ecs.make_entity_val(idx)
+        var int egen = 0
+        match ent_val:
+            Value.Object(eo):
+                for ef in eo.fields:
+                    if ef.0 == "generation":
+                        match ef.1:
+                            Value.Int(g): egen = g
+                            _: nil
+            _: nil
+        ecs.set_current_entity(true, idx, egen)
+        mut child = new_env(outer_env.clone())
+        child.define("entity", ent_val.clone())
+        var int vi = 0
+        while vi < fs.vars.length:
+            let vname = fs.vars[vi]
+            let is_mut = if vi < fs.ecs_muts.length: fs.ecs_muts[vi] else: false
+            var Value bval = ent_val.clone()
+            if vi < fs.ecs_types.length:
+                if let tname = fs.ecs_types[vi]:
+                    if tname != "Entity":
+                        bval = ecs.get_component(idx, tname) else Value.Nil
+            if is_mut:
+                child.define_mut(vname, bval)
+            else:
+                child.define(vname, bval)
+            vi = vi + 1
+        interp.current_env = child
+        let sig = exec_block(interp, fs.body)
+        interp.current_env = outer_env.clone()
+        if interp.has_pending_return or interp.has_pending_throw:
+            ecs.set_current_entity(prev.0, prev.1, prev.2)
+            return sig
+        if let s = sig:
+            match s:
+                BreakSignal(_):
+                    break
+                ContinueSignal:
+                    nil
+                _:
+                    ecs.set_current_entity(prev.0, prev.1, prev.2)
+                    return sig
+        var int mi = 0
+        while mi < fs.ecs_types.length:
+            let is_mut = if mi < fs.ecs_muts.length: fs.ecs_muts[mi] else: false
+            if is_mut:
+                if let tname = fs.ecs_types[mi]:
+                    if tname != "Entity":
+                        ecs.mark_changed(idx, tname)
+            mi = mi + 1
+    ecs.set_current_entity(prev.0, prev.1, prev.2)
+    nil
+
+# ─── System Execution & Game Loop ─────────────────────────────────────────────
+
+def void bind_ecs_ambient_env(mut Interpreter interp, mut Env'actor env):
+    mut ecs = interp.ecs
+    env.define_mut("commands", Value.Object(ObjectInner(type_name= "__BoringEcsCommands", fields= [])))
+    env.define("ecs", Value.Object(ObjectInner(type_name= "__BoringEcsNs", fields= [])))
+    env.define("resource", Value.Object(ObjectInner(type_name= "__BoringEcsResourceNs", fields= [])))
+    if let t = ecs.get_resource("Time"):
+        env.define("time", t)
+    if let inp = ecs.get_resource("ButtonInput"):
+        env.define("input", inp)
+    if let cur_ent = ecs.get_current_entity_val():
+        env.define("entity", cur_ent)
+
+def string? ecs_system_schedule(FnDecl f):
+    for a in f.attrs:
+        let low = a.name.toLower()
+        if low == "startup":
+            return "Startup"
+        if low == "fixedupdate" or low == "fixed_update":
+            return "FixedUpdate"
+        if low == "update":
+            return "Update"
+        if low == "postupdate" or low == "post_update":
+            return "PostUpdate"
+        if low == "schedule" and a.args.length > 0:
+            return a.args[0]
+    nil
+
+def bool ecs_is_builtin_resource(string name):
+    name == "Commands" or name == "Time" or name == "ButtonInput" or name == "TextUiWriter"
+
+def void run_ecs_system(mut Interpreter interp, string? comp_type, FnDecl f):
+    mut ecs = interp.ecs
+    let has_inline_queries = ecs_stmts_use_ecs(f.body)
+    mut [(string, string, bool)] comp_params = []
+    mut [(string, string)] res_params = []
+    for p in f.params:
+        if let pty = p.ty:
+            let is_opt = ecs_is_optional_type(pty.clone())
+            if let pbase = ecs_type_base_name(pty):
+                if ecs_is_builtin_resource(pbase.clone()) or ecs.has_resource(pbase.clone()):
+                    res_params.push((p.name, pbase))
+                elif pbase != "Entity":
+                    comp_params.push((p.name, pbase, is_opt))
+    let is_per_entity = comp_type != nil or (not has_inline_queries and (comp_params.length > 0 or f.where_clause.length > 0))
+    if is_per_entity:
+        # Per-entity system (component method or free system with component params / where clause).
+        mut [string] with_types = []
+        if let owner_comp = comp_type.clone():
+            with_types.push(owner_comp)
+        for cp in comp_params:
+            if not cp.2:
+                with_types.push(cp.1)
+        mut [string] without_types = []
+        mut [string] added_types = []
+        mut [string] changed_types = []
+        ecs_extract_where_filters(f.where_clause, with_types, without_types, added_types, changed_types)
+        let matching = ecs.query_entities(with_types, without_types, added_types, changed_types)
+        let prev = ecs.save_current_entity()
+        let saved_env = interp.current_env
+        for idx in matching:
+            let ent_val = ecs.make_entity_val(idx)
+            var int egen = 0
+            match ent_val:
+                Value.Object(eo):
+                    for ef in eo.fields:
+                        if ef.0 == "generation":
+                            match ef.1:
+                                Value.Int(g): egen = g
+                                _: nil
+                _: nil
+            ecs.set_current_entity(true, idx, egen)
+            let genv = interp.global_env
+            mut sys_env = new_env(genv)
+            bind_ecs_ambient_env(interp, sys_env)
+            if let owner_comp = comp_type.clone():
+                if let self_comp = ecs.get_component(idx, owner_comp):
+                    sys_env.define_mut("self", self_comp)
+            for p in f.params:
+                var Value pval = Value.Nil
+                if let pty = p.ty:
+                    if let pbase = ecs_type_base_name(pty):
+                        if pbase == "Entity":
+                            pval = ent_val.clone()
+                        elif pbase == "Commands":
+                            pval = Value.Object(ObjectInner(type_name= "__BoringEcsCommands", fields= []))
+                        elif let res_val = ecs.get_resource(pbase.clone()):
+                            pval = res_val
+                        elif let comp_val = ecs.get_component(idx, pbase):
+                            pval = comp_val
+                if p.mutable:
+                    sys_env.define_mut(p.name, pval)
+                else:
+                    sys_env.define(p.name, pval)
+            interp.current_env = sys_env
+            _ = exec_block(interp, f.body)
+            interp.current_env = saved_env.clone()
+            if let owner_comp = comp_type.clone():
+                if f.mutating:
+                    ecs.mark_changed(idx, owner_comp)
+            for p in f.params:
+                if p.mutable:
+                    if let pty = p.ty:
+                        if let pbase = ecs_type_base_name(pty):
+                            if pbase != "Entity" and ecs.entity_has_component(idx, pbase.clone()):
+                                ecs.mark_changed(idx, pbase)
+            if interp.has_pending_return:
+                interp.has_pending_return = false
+                interp.pending_return_val = Value.Nil
+            if interp.has_pending_throw:
+                ecs.set_current_entity(prev.0, prev.1, prev.2)
+                return
+        ecs.set_current_entity(prev.0, prev.1, prev.2)
+        ecs.apply_commands()
+    else:
+        # Free function system: bind resources/ambient env and run once.
+        let saved_env = interp.current_env
+        let genv = interp.global_env
+        mut sys_env = new_env(genv)
+        bind_ecs_ambient_env(interp, sys_env)
+        for p in f.params:
+            var Value pval = Value.Nil
+            if let pty = p.ty:
+                if let pbase = ecs_type_base_name(pty):
+                    if pbase == "Commands":
+                        pval = Value.Object(ObjectInner(type_name= "__BoringEcsCommands", fields= []))
+                    elif let res_val = ecs.get_resource(pbase):
+                        pval = res_val
+            if p.mutable:
+                sys_env.define_mut(p.name, pval)
+            else:
+                sys_env.define(p.name, pval)
+        interp.current_env = sys_env
+        _ = exec_block(interp, f.body)
+        interp.current_env = saved_env
+        if interp.has_pending_return:
+            interp.has_pending_return = false
+            interp.pending_return_val = Value.Nil
+        ecs.apply_commands()
+
+def void ecs_sync_time_resource(mut Interpreter interp):
+    mut ecs = interp.ecs
+    let t = ecs.get_time()
+    if let res = ecs.get_resource("Time"):
+        match res:
+            Value.Object(obj):
+                obj.set_field("delta", Value.Float64(t.0))
+                obj.set_field("elapsed", Value.Float64(t.1))
+            _: nil
+
+def bool ecs_system_state_matches(mut Interpreter interp, FnDecl f):
+    mut ecs = interp.ecs
+    for a in f.attrs:
+        let low = a.name.toLower()
+        if low == "state" or low == "instate" or low == "in_state":
+            for arg in a.args:
+                let parts = arg.replace(":", ".").split(".")
+                if parts.length == 2:
+                    let enum_name = parts[0].trim()
+                    let var_name = parts[1].trim()
+                    if let rv = ecs.get_resource(enum_name.clone()):
+                        match rv:
+                            Value.EnumVariant(tn, vn, _):
+                                if tn != enum_name or vn != var_name:
+                                    return false
+                            _: return false
+                    else:
+                        return false
+    true
+
+def [(string?, FnDecl)] ecs_sort_systems([(string?, FnDecl)] systems):
+    let n = systems.length
+    if n <= 1:
+        return systems
+    mut {string=int} name_to_idx = {=}
+    var int i = 0
+    while i < n:
+        let sys = systems[i]
+        let f = sys.1
+        if let comp = sys.0:
+            name_to_idx.set("{comp}.{f.name}", i)
+            name_to_idx.set("{comp}::{f.name}", i)
+        if not name_to_idx.has(f.name.clone()):
+            name_to_idx.set(f.name.clone(), i)
+        i = i + 1
+    mut [[int]] adj = []
+    mut [int] indeg = []
+    i = 0
+    while i < n:
+        adj.push([])
+        indeg.push(0)
+        i = i + 1
+    i = 0
+    while i < n:
+        let f = systems[i].1
+        for a in f.attrs:
+            let string low = a.name.toLower()
+            if low == "after":
+                for target in a.args:
+                    let string tn = target.trim()
+                    if name_to_idx.has(tn.clone()):
+                        let dep_idx = name_to_idx[tn]
+                        if dep_idx != i and not adj[dep_idx].contains(i):
+                            mut [int] row = adj[dep_idx]
+                            row.push(i)
+                            adj[dep_idx] = row
+                            indeg[i] = indeg[i] + 1
+            elif low == "before":
+                for target in a.args:
+                    let string tn = target.trim()
+                    if name_to_idx.has(tn.clone()):
+                        let after_idx = name_to_idx[tn]
+                        if after_idx != i and not adj[i].contains(after_idx):
+                            mut [int] row = adj[i]
+                            row.push(after_idx)
+                            adj[i] = row
+                            indeg[after_idx] = indeg[after_idx] + 1
+        i = i + 1
+    mut [bool] done = []
+    i = 0
+    while i < n:
+        done.push(false)
+        i = i + 1
+    mut [(string?, FnDecl)] sorted = []
+    var int step = 0
+    while step < n:
+        var int pick = -1
+        var int j = 0
+        while j < n:
+            if not done[j] and indeg[j] == 0:
+                pick = j
+                break
+            j = j + 1
+        if pick < 0:
+            j = 0
+            while j < n:
+                if not done[j]:
+                    pick = j
+                    break
+                j = j + 1
+        if pick < 0:
+            break
+        done[pick] = true
+        sorted.push(systems[pick])
+        for nxt in adj[pick]:
+            indeg[nxt] = indeg[nxt] - 1
+        step = step + 1
+    sorted
+
+def void ecs_trigger_observers(mut Interpreter interp, string ev_name, Value ev_val):
+    mut ecs = interp.ecs
+    let obs_list = ecs.get_observers(ev_name)
+    if obs_list.length == 0:
+        return
+    let on_obj = Value.Object(ObjectInner(type_name= "On", fields= [("event", ev_val)]))
+    let saved_env = interp.current_env
+    for f in obs_list:
+        let genv = interp.global_env
+        mut obs_env = new_env(genv)
+        bind_ecs_ambient_env(interp, obs_env)
+        var int pi = 0
+        for p in f.params:
+            if pi == 0:
+                if p.mutable:
+                    obs_env.define_mut(p.name, on_obj.clone())
+                else:
+                    obs_env.define(p.name, on_obj.clone())
+            else:
+                var Value pval = Value.Nil
+                if let pty = p.ty:
+                    if let pbase = ecs_type_base_name(pty):
+                        if let res_val = ecs.get_resource(pbase):
+                            pval = res_val
+                if p.mutable:
+                    obs_env.define_mut(p.name, pval)
+                else:
+                    obs_env.define(p.name, pval)
+            pi = pi + 1
+        interp.current_env = obs_env
+        _ = exec_block(interp, f.body)
+        if interp.has_pending_return:
+            interp.has_pending_return = false
+            interp.pending_return_val = Value.Nil
+        if interp.has_pending_throw:
+            interp.current_env = saved_env
+            return
+    interp.current_env = saved_env
+
+def void run_ecs_game_loop(mut Interpreter interp, Program prog):
+    mut [(string?, FnDecl)] startup = []
+    mut [(string?, FnDecl)] fixed_update = []
+    mut [(string?, FnDecl)] update = []
+    mut [(string?, FnDecl)] post_update = []
+    mut ecs = interp.ecs
+    ecs.clear_observers()
+    for item in prog.items:
+        match item:
+            Item.Struct(s):
+                let string? owner_name = s.name.clone()
+                for m in s.methods:
+                    if ecs_fn_uses_ecs(m):
+                        if let ev_name = ecs_observer_event_name(m):
+                            ecs.add_observer(ev_name, m)
+                        else:
+                            let sched = ecs_system_schedule(m) else "Update"
+                            if sched == "Startup":
+                                startup.push((owner_name.clone(), m))
+                            elif sched == "FixedUpdate":
+                                fixed_update.push((owner_name.clone(), m))
+                            elif sched == "PostUpdate":
+                                post_update.push((owner_name.clone(), m))
+                            else:
+                                update.push((owner_name.clone(), m))
+            Item.Fn(f):
+                if ecs_fn_uses_ecs(f):
+                    if let ev_name = ecs_observer_event_name(f):
+                        ecs.add_observer(ev_name, f)
+                    else:
+                        let sched = ecs_system_schedule(f) else "Update"
+                        if sched == "Startup":
+                            startup.push((nil, f))
+                        elif sched == "FixedUpdate":
+                            fixed_update.push((nil, f))
+                        elif sched == "PostUpdate":
+                            post_update.push((nil, f))
+                        else:
+                            update.push((nil, f))
+            _: nil
+    let sorted_startup = ecs_sort_systems(startup)
+    let sorted_fixed_update = ecs_sort_systems(fixed_update)
+    let sorted_update = ecs_sort_systems(update)
+    let sorted_post_update = ecs_sort_systems(post_update)
+    var int max_frames = 1
+    if let env_frames = environment("BORING_ECS_FRAMES"):
+        let trimmed_frames = env_frames.trim()
+        if let parsed = (trimmed_frames as int):
+            if parsed >= 0:
+                max_frames = parsed
+    for sys in sorted_startup:
+        if ecs_system_state_matches(interp, sys.1):
+            run_ecs_system(interp, sys.0, sys.1)
+            if interp.has_pending_throw:
+                return
+    var int frame = 0
+    while frame < max_frames:
+        ecs_sync_time_resource(interp)
+        for sys in sorted_fixed_update:
+            if ecs_system_state_matches(interp, sys.1):
+                run_ecs_system(interp, sys.0, sys.1)
+                if interp.has_pending_throw:
+                    return
+        for sys in sorted_update:
+            if ecs_system_state_matches(interp, sys.1):
+                run_ecs_system(interp, sys.0, sys.1)
+                if interp.has_pending_throw:
+                    return
+        for sys in sorted_post_update:
+            if ecs_system_state_matches(interp, sys.1):
+                run_ecs_system(interp, sys.0, sys.1)
+                if interp.has_pending_throw:
+                    return
+        ecs.advance_tick()
+        frame = frame + 1
+
+# ─── ECS Commands & Builtins ──────────────────────────────────────────────────
+
+def Value? handle_ecs_object_method(mut Interpreter interp, ObjectInner'actor obj, string method_name, [Value] args):
+    let tname = obj.type_name
+    if tname == "__BoringEcsCommands":
+        if method_name == "spawn":
+            let bundle = args[0] else Value.Tuple([])
+            return ecs_spawn_with_requires(interp, bundle)
+        if method_name == "entity":
+            let e = args[0] else Value.Nil
+            var int eid = 0
+            var int egen = 0
+            match e:
+                Value.Object(eo):
+                    for f in eo.fields:
+                        if f.0 == "id":
+                            match f.1:
+                                Value.Int(n): eid = n
+                                _: nil
+                        elif f.0 == "generation":
+                            match f.1:
+                                Value.Int(n): egen = n
+                                _: nil
+                _: nil
+            return Value.Object(ObjectInner(type_name= "__BoringEcsEntityCommands", fields= [("id", Value.Int(eid)), ("generation", Value.Int(egen))]))
+        if method_name == "insertResource" or method_name == "insert_resource":
+            let r = args[0] else Value.Nil
+            match r:
+                Value.Object(ro):
+                    let rname = ro.type_name
+                    mut ecs = interp.ecs
+                    ecs.set_resource(rname, r)
+                _: nil
+            return Value.Nil
+        if method_name == "removeResource" or method_name == "remove_resource":
+            if args.length > 0:
+                match args[0]:
+                    Value.Str(rname):
+                        mut ecs = interp.ecs
+                        ecs.remove_resource(rname)
+                    _: nil
+            return Value.Nil
+        if method_name == "trigger":
+            if args.length > 0:
+                let ev_val = args[0]
+                match ev_val:
+                    Value.Object(eo):
+                        let ev_name = eo.type_name
+                        ecs_trigger_observers(interp, ev_name, ev_val)
+                    _: nil
+            return Value.Nil
+        return Value.Nil
+    if tname == "__BoringEcsEntityCommands":
+        var int eid = 0
+        var int egen = 0
+        for f in obj.fields:
+            if f.0 == "id":
+                match f.1:
+                    Value.Int(n): eid = n
+                    _: nil
+            elif f.0 == "generation":
+                match f.1:
+                    Value.Int(n): egen = n
+                    _: nil
+        mut ecs = interp.ecs
+        if method_name == "insert":
+            if args.length > 0:
+                let cval = args[0]
+                match cval:
+                    Value.Object(co):
+                        let cname = co.type_name
+                        ecs.insert_component(eid, cname.clone(), cval)
+                        mut [(string, Value)] req_pairs = []
+                        mut [string] seen = []
+                        ecs_append_required_components(interp, cname, req_pairs, seen)
+                        for rp in req_pairs:
+                            if not ecs.entity_has_component(eid, rp.0):
+                                ecs.insert_component(eid, rp.0, rp.1)
+                    _: nil
+            return Value.Object(ObjectInner(type_name= "__BoringEcsEntityCommands", fields= [("id", Value.Int(eid)), ("generation", Value.Int(egen))]))
+        if method_name == "remove":
+            if args.length > 0:
+                match args[0]:
+                    Value.Str(cname): ecs.remove_component(eid, cname)
+                    Value.StructDef(cname): ecs.remove_component(eid, cname)
+                    _: nil
+            return Value.Object(ObjectInner(type_name= "__BoringEcsEntityCommands", fields= [("id", Value.Int(eid)), ("generation", Value.Int(egen))]))
+        if method_name == "despawn":
+            ecs.queue_despawn(eid)
+            return Value.Nil
+        if method_name == "id":
+            return Value.Object(ObjectInner(type_name= "Entity", fields= [("id", Value.Int(eid)), ("generation", Value.Int(egen))]))
+        return Value.Nil
+    nil
+
+def Value? handle_ecs_field_access(mut Interpreter interp, ObjectInner'actor obj, string field_name):
+    let tname = obj.type_name
+    if tname == "__BoringEcsNs":
+        mut ecs = interp.ecs
+        if field_name == "time":
+            return ecs.get_resource("Time") else Value.Nil
+        if field_name == "input":
+            return ecs.get_resource("ButtonInput") else Value.Nil
+        if field_name == "entity":
+            return ecs.get_current_entity_val() else Value.Nil
+        if field_name == "commands":
+            return Value.Object(ObjectInner(type_name= "__BoringEcsCommands", fields= []))
+        if field_name == "resource":
+            return Value.Object(ObjectInner(type_name= "__BoringEcsResourceNs", fields= []))
+        return Value.Nil
+    if tname == "__BoringEcsResourceNs":
+        mut ecs = interp.ecs
+        if let r = ecs.get_resource(field_name.clone()):
+            return r
+        let cap = if field_name.length > 0:
+            let p1 = field_name.slice(0, 1).toUpper()
+            let p2 = field_name.slice(1, field_name.length)
+            "{p1}{p2}"
+        else:
+            field_name
+        if let r2 = ecs.get_resource(cap):
+            return r2
+        return Value.Nil
+    nil
+
+def Value ecs_despawn_builtin(mut Interpreter interp, [Value] args):
+    mut ecs = interp.ecs
+    if args.length == 0:
+        if let cur = ecs.get_current_entity_val():
+            match cur:
+                Value.Object(eo):
+                    for f in eo.fields:
+                        if f.0 == "id":
+                            match f.1:
+                                Value.Int(eid): ecs.queue_despawn(eid)
+                                _: nil
+                _: nil
+        return Value.Nil
+    match args[0]:
+        Value.Object(eo):
+            for f in eo.fields:
+                if f.0 == "id":
+                    match f.1:
+                        Value.Int(eid): ecs.queue_despawn(eid)
+                        _: nil
+        _: nil
+    Value.Nil

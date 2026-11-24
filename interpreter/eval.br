@@ -24,6 +24,77 @@ def void pop_scope(mut Interpreter interp):
 
 # Main expression evaluator
 
+def Value eval_expr_borrow(mut Interpreter interp, Expr expr):
+    match expr.kind:
+        ExprKind.Var(name):
+            let result = interp.current_env.get(name)
+            if let val = result:
+                match val:
+                    Value.Uninitialized:
+                        throw "variable '{name}' used before being assigned"
+                    _:
+                        return val
+            let self_opt = interp.current_env.get("self")
+            if let self_val = self_opt:
+                match self_val:
+                    Value.Object(obj):
+                        let field_opt = obj.get_field(name)
+                        if let fval = field_opt:
+                            return fval
+                    _: nil
+            throw "undefined variable '{name}'"
+        ExprKind.Field(obj_expr, field_name):
+            eval_field_access(interp, obj_expr, field_name, true)
+        _:
+            eval_expr(interp, expr)
+
+def Value eval_field_access(mut Interpreter interp, Expr obj_expr, string field_name, bool borrow):
+    # `fixed16_16.epsilon` / `.min` / `.max`
+    match obj_expr.kind:
+        ExprKind.Var(fixed_tname):
+            if let cfmt = fixed_fmt_of_name(fixed_tname):
+                if let cv = fixed_constant(cfmt, field_name):
+                    return cv
+                throw "{cfmt.name()} has no member '{field_name}'"
+        _: nil
+    let obj = if borrow: eval_expr_borrow(interp, obj_expr) else: eval_expr(interp, obj_expr)
+    if interp.has_pending_throw:
+        return Value.Nil
+    # `Config.count`: a type-level field.
+    match obj:
+        Value.StructDef(tv_owner):
+            if let tv_val = interp.type_var_store.get(tv_owner + "::" + field_name):
+                return if borrow: tv_val else: share_if_array(tv_val)
+        _: nil
+    # `self.<state field>` inside a `view` method reads the mounted state (`__st`).
+    match obj_expr.kind:
+        ExprKind.Var(self_nm):
+            if self_nm == "self":
+                match obj:
+                    Value.Object(self_inner):
+                        if self_inner.get_field(field_name) == nil:
+                            let st_for_read = interp.current_env.get(field_name)
+                            if let stv = st_for_read:
+                                return if borrow: stv else: share_if_array(stv)
+                    _: nil
+        _: nil
+    # A failed `throws` task: the throw surfaces at `.value`/`.wait`, not at the spawn.
+    if task_obj_type_name(obj) == "__Task__" and (field_name == "value" or field_name == "wait"):
+        match obj:
+            Value.Object(tinner):
+                let failed_opt = tinner.get_field("__failed")
+                if let failed_val = failed_opt:
+                    interp.set_pending_throw(failed_val)
+                    return Value.Nil
+            _: ()
+    match obj:
+        Value.Object(eo):
+            if let ecs_val = handle_ecs_field_access(interp, eo, field_name):
+                return if borrow: ecs_val else: share_if_array(ecs_val)
+        _: nil
+    let res = get_field(interp, obj, field_name)
+    if borrow: res else: share_if_array(res)
+
 def Value eval_expr(mut Interpreter interp, Expr expr):
     match expr.kind:
         # Literals
@@ -49,7 +120,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             if interp.has_pending_throw:
                 return Value.Nil
             if macro_name == "vec":
-                Value.Array(evaled_args)
+                val_array(evaled_args)
             elif macro_name == "format" or macro_name == "println" or macro_name == "print":
                 var formatted = ""
                 if macro_args.length == 0:
@@ -129,7 +200,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     Value.Uninitialized:
                         throw "variable '{name}' used before being assigned"
                     _:
-                        val
+                        share_if_array(val)
             else:
                 # Check implicit self field access
                 let self_opt = interp.current_env.get("self")
@@ -138,7 +209,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         Value.Object(obj):
                             let field_opt = obj.get_field(name)
                             if let fval = field_opt:
-                                fval
+                                share_if_array(fval)
                             else:
                                 throw "undefined variable '{name}'"
                         _:
@@ -400,7 +471,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                             assign_target(interp, args[0].value, default_like_value(mem_old))
                             return mem_old
                 _: nil
-            let recv = eval_expr(interp, recv_expr)
+            let recv = eval_expr_borrow(interp, recv_expr)
             # `'atomic` scalar `.swap(v)`: store `v`, return the previous value.
             if method == "swap" and args.length == 1:
                 let swap_scalar = match recv:
@@ -421,7 +492,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             # `arr.drain(range)`: removes the range from the receiver, returns what was removed.
             if method == "drain" and args.length == 1:
                 match recv:
-                    Value.Array(darr):
+                    Value.Array(darr_inner):
+                        let darr = darr_inner.clone_elems()
                         match eval_expr(interp, args[0].value):
                             Value.Range(rs, re, rincl, _):
                                 let rend = if rincl: re + 1 else re
@@ -436,8 +508,11 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                     else:
                                         remaining.push(darr[di])
                                     di = di + 1
-                                assign_target(interp, recv_expr, Value.Array(remaining))
-                                return Value.Array(removed)
+                                if not darr_inner.is_shared():
+                                    darr_inner.set_elems(remaining)
+                                else:
+                                    assign_target(interp, recv_expr, val_array(remaining))
+                                return val_array(removed)
                             _: nil
                     _: nil
             # `h.clone()` on a `'actor`/`'shared` binding clones the handle: an alias.
@@ -473,6 +548,20 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             # would otherwise overwrite the callee's with stale values).
             if recv_is_self:
                 sync_self_fields_to_object(interp, recv)
+            # Fast-path in-place `push` for unshared arrays (avoids cloning on every push)
+            if method == "push" and arg_vals.length >= 1:
+                match recv:
+                    Value.Array(arr_inner):
+                        let push_val = arg_vals[0] else Value.Nil
+                        if not arr_inner.is_shared():
+                            arr_inner.push_val(push_val)
+                            return Value.Array(arr_inner)
+                        var new_arr = arr_inner.clone_elems()
+                        new_arr.push(push_val)
+                        let res = val_array(new_arr)
+                        assign_target(interp, recv_expr, res)
+                        return res
+                    _: nil
             let result = call_method(interp, recv, method, arg_vals)
             if recv_is_self:
                 sync_self_fields_from_object(interp, recv)
@@ -487,24 +576,31 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             # Write back mutating array methods to their source lvalue
             if method == "pop":
                 match recv:
-                    Value.Array(arr):
-                        let n = arr.length
+                    Value.Array(arr_inner):
+                        let n = arr_inner.len()
                         if n > 0:
-                            var new_arr = arr
-                            new_arr.remove(n - 1)
-                            assign_target(interp, recv_expr, Value.Array(new_arr))
+                            if not arr_inner.is_shared():
+                                _ = arr_inner.pop_val()
+                            else:
+                                var new_arr = arr_inner.clone_elems()
+                                new_arr.remove(n - 1)
+                                assign_target(interp, recv_expr, val_array(new_arr))
                     _: nil
             elif method == "remove":
                 match recv:
-                    Value.Array(arr):
-                        let arr_len = arr.length
+                    Value.Array(arr_inner):
+                        let arr_len = arr_inner.len()
                         let idx_val = arg_vals[0] else Value.Int(0)
                         match idx_val:
                             Value.Int(idx):
                                 let actual_idx = if idx < 0: arr_len + idx else idx
-                                var new_arr = arr
-                                new_arr.remove(actual_idx)
-                                assign_target(interp, recv_expr, Value.Array(new_arr))
+                                if actual_idx >= 0 and actual_idx < arr_len:
+                                    if not arr_inner.is_shared():
+                                        _ = arr_inner.remove_at(actual_idx)
+                                    else:
+                                        var new_arr = arr_inner.clone_elems()
+                                        new_arr.remove(actual_idx)
+                                        assign_target(interp, recv_expr, val_array(new_arr))
                             _: nil
                     Value.Dict(_):
                         assign_target(interp, recv_expr, result)
@@ -515,14 +611,23 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                 # Collection write-back belongs to the receiver, not to every
                 # user method with the same name and a collection return value.
                 match recv:
+                    Value.Dict(_):
+                        if method == "insert":
+                            match result:
+                                Value.Dict(_): assign_target(interp, recv_expr, result)
+                                _: nil
                     Value.Set(_):
                         if method == "insert":
                             match result:
                                 Value.Set(_): assign_target(interp, recv_expr, result)
                                 _: nil
-                    Value.Array(_):
+                    Value.Array(arr_inner):
                         match result:
-                            Value.Array(_): assign_target(interp, recv_expr, result)
+                            Value.Array(res_inner):
+                                if not arr_inner.is_shared():
+                                    arr_inner.set_elems(res_inner.clone_elems())
+                                else:
+                                    assign_target(interp, recv_expr, result)
                             _: nil
                     _: nil
             elif method == "set" or method == "put":
@@ -534,7 +639,11 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     _: nil
             elif method == "clear":
                 match recv:
-                    Value.Array(_): assign_target(interp, recv_expr, result)
+                    Value.Array(arr_inner):
+                        if not arr_inner.is_shared():
+                            arr_inner.set_elems([])
+                        else:
+                            assign_target(interp, recv_expr, result)
                     Value.Dict(_): assign_target(interp, recv_expr, result)
                     Value.Set(_): assign_target(interp, recv_expr, result)
                     _: nil
@@ -549,49 +658,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
 
         # Field access
         ExprKind.Field(obj_expr, field_name):
-            # `fixed16_16.epsilon` / `.min` / `.max`
-            match obj_expr.kind:
-                ExprKind.Var(fixed_tname):
-                    if let cfmt = fixed_fmt_of_name(fixed_tname):
-                        if let cv = fixed_constant(cfmt, field_name):
-                            return cv
-                        throw "{cfmt.name()} has no member '{field_name}'"
-                _: nil
-            let obj = eval_expr(interp, obj_expr)
-            # `Config.count`: a type-level field.
-            match obj:
-                Value.StructDef(tv_owner):
-                    if let tv_val = interp.type_var_store.get(tv_owner + "::" + field_name):
-                        return tv_val
-                _: nil
-            # `self.<state field>` inside a `view` method reads the mounted state (`__st`).
-            match obj_expr.kind:
-                ExprKind.Var(self_nm):
-                    if self_nm == "self":
-                        match obj:
-                            Value.Object(self_inner):
-                                if self_inner.get_field(field_name) == nil:
-                                    let st_for_read = interp.current_env.get(field_name)
-                                    if let stv = st_for_read:
-                                        return stv
-                            _: nil
-                _: nil
-            # A failed `throws` task: the throw surfaces at `.value`/`.wait`, not at the spawn.
-            if task_obj_type_name(obj) == "__Task__" and (field_name == "value" or field_name == "wait"):
-                match obj:
-                    Value.Object(tinner):
-                        let failed_opt = tinner.get_field("__failed")
-                        if let failed_val = failed_opt:
-                            interp.set_pending_throw(failed_val)
-                            return Value.Nil
-                    _: ()
-            get_field(interp, obj, field_name)
+            eval_field_access(interp, obj_expr, field_name, false)
 
         ExprKind.OptionalField(obj_expr, field_name):
-            let obj = eval_expr(interp, obj_expr)
+            let obj = eval_expr_borrow(interp, obj_expr)
             match obj:
                 Value.Nil: Value.Nil
-                _: get_field(interp, obj, field_name)
+                _: share_if_array(get_field(interp, obj, field_name))
 
         ExprKind.OptionalMethodCall(recv_expr, method, args):
             let recv = eval_expr(interp, recv_expr)
@@ -611,13 +684,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             match idx_expr.kind:
                 # Slice: a[M..<N], a[..<N], a[M..], a[..]
                 ExprKind.SliceRange(start_expr, end_expr, inclusive):
-                    let obj = eval_expr(interp, obj_expr)
+                    let obj = eval_expr_borrow(interp, obj_expr)
                     # A string slices by character (`s[1..<3]`), like an array of its chars.
                     let src_is_str = match obj:
                         Value.Str(_): true
                         _: false
                     let items = match obj:
-                        Value.Array(v): v
+                        Value.Array(arr_inner): arr_inner.clone_elems()
                         Value.Str(sv): sv.chars().map((c): Value.Str(c))
                         _: throw "slice requires an array, got {obj.type_name()}"
                     let len = items.length
@@ -640,7 +713,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         if src_is_str:
                             Value.Str("")
                         else:
-                            Value.Array([])
+                            val_array([])
                     else:
                         mut result = []
                         var k = lo
@@ -655,18 +728,18 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                                     _: nil
                             Value.Str(joined)
                         else:
-                            Value.Array(result)
+                            val_array(result)
                 _:
-                    let obj = eval_expr(interp, obj_expr)
+                    let obj = eval_expr_borrow(interp, obj_expr)
                     let idx = eval_expr(interp, idx_expr)
                     # A big read-only array of a running kernel, kept in chunks so that reading one
                     # element copies one chunk, not the whole array.
                     match obj:
                         Value.Object(chunked):
                             if chunked.type_name == "__ArrayRef":
-                                return chunked_array_get(chunked, idx)
+                                return share_if_array(chunked_array_get(chunked, idx))
                         _: nil
-                    get_index(interp, obj, idx)
+                    share_if_array(get_index(interp, obj, idx))
 
         # Labeled multi-dim array indexing: a[width = w, height = h]
         # (docs/array-multidim-types.md). Order-free at the use site — labels
@@ -704,8 +777,8 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         let tv = interp.current_env.get(tn)
                         if let tval = tv:
                             match tval:
-                                Value.StructDef(_): return Value.Array([])
-                                Value.EnumDef(_): return Value.Array([])
+                                Value.StructDef(_): return val_array([])
+                                Value.EnumDef(_): return val_array([])
                                 _: nil
                     _: nil
             mut vals = []
@@ -741,7 +814,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                             Value.Float64(f): vals[i] = Value.Float32(f as float32)
                             Value.Int(n): vals[i] = Value.Float32(n as float32)
                             _: nil
-            Value.Array(vals)
+            val_array(vals)
 
         ExprKind.ArrayFill(value_expr, count_expr):
             let count_val = eval_expr(interp, count_expr)
@@ -752,7 +825,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             mut result = []
             for _ in 0..<n:
                 result.push(v)
-            Value.Array(result)
+            val_array(result)
 
         ExprKind.ArrayComp(comp_expr, var_name, count_expr):
             let count_val = eval_expr(interp, count_expr)
@@ -763,18 +836,18 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
             for i in 0..<n:
                 env_define(interp, var_name, Value.Int(i), false)
                 result.push(eval_expr(interp, comp_expr))
-            Value.Array(result)
+            val_array(result)
 
         ExprKind.ArrayCompIter(comp_expr, var_name, iter_expr):
-            let col_val = eval_expr(interp, iter_expr)
+            let col_val = eval_expr_borrow(interp, iter_expr)
             let elems = match col_val:
-                Value.Array(v): v
+                Value.Array(arr_inner): arr_inner.clone_elems()
                 _: throw "array comprehension source must be an array, got {col_val.type_name()}"
             mut result = []
             for item in elems:
                 env_define(interp, var_name, item, false)
                 result.push(eval_expr(interp, comp_expr))
-            Value.Array(result)
+            val_array(result)
 
         # Labeled multi-dim array comprehension (docs/array-multidim-types.md)
         # — both the chained-for form (`for w in ..<W for h in ..<H`) and the
@@ -934,7 +1007,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                         match last_field.ty:
                             Type.Array(_):
                                 let values = collect_array_block(interp, body, interp.current_env)
-                                return instantiate_struct(interp, decl, [Value.Labeled(last_field.name, Value.Array(values))])
+                                return instantiate_struct(interp, decl, [Value.Labeled(last_field.name, val_array(values))])
                             _: nil
                 # `describe:` + block: the callee is a free function whose only parameter is a
                 # trailing array (collect the items) or a closure (the block is its body).
@@ -944,7 +1017,7 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                             match pty:
                                 Type.Array(_):
                                     let fvalues = collect_array_block(interp, body, interp.current_env)
-                                    return call_fn(interp, fdecl, [Value.Array(fvalues)], nil)
+                                    return call_fn(interp, fdecl, [val_array(fvalues)], nil)
                                 Type.Named(pn):
                                     if pn == "__fn":
                                         let tail = Value.Closure([], body, interp.current_env)
@@ -1216,10 +1289,13 @@ def Value eval_expr(mut Interpreter interp, Expr expr):
                     results.push(task_obj_get_value(join_val))
                 else:
                     results.push(join_val)
-            Value.Array(results)
+            val_array(results)
 
         ExprKind.Query(q):
             eval_query_expr(interp, q, expr.line)
+
+        ExprKind.EcsFetch(f):
+            eval_ecs_fetch(interp, f, expr.line)
 
         _:
             throw "unhandled expression kind"
@@ -1308,7 +1384,7 @@ def Value eval_query_expr(mut Interpreter interp, QueryExpr q, int line):
 
     match q.kind:
         QueryKind.All:
-            Value.Array(filtered_projected)
+            val_array(filtered_projected)
         QueryKind.First | QueryKind.Any:
             if filtered_projected.length > 0:
                 filtered_projected[0]
@@ -2495,10 +2571,11 @@ def Value apply_binop(BinOp op, Value l, Value r):
                     Value.Array(a):
                         match r:
                             Value.Array(b):
-                                var merged = a
-                                for item in b:
+                                var merged = a.clone_elems()
+                                let b_elems = b.clone_elems()
+                                for item in b_elems:
                                     merged.push(item)
-                                Value.Array(merged)
+                                val_array(merged)
                             _:
                                 throw "cannot add Array and {r.type_name()}"
                     _:
@@ -2816,7 +2893,7 @@ def Value get_field(mut Interpreter interp, Value obj, string field_name):
                 throw "no field '{field_name}' on range"
         Value.Array(items):
             if field_name == "length" or field_name == "count" or field_name == "len":
-                Value.Int(items.length)
+                Value.Int(items.len())
             else:
                 throw "no field '{field_name}' on array"
         Value.LabeledArray(items, axes):
@@ -2859,9 +2936,10 @@ def Value get_index(mut Interpreter interp, Value obj, Value idx):
         Value.Array(items):
             match idx:
                 Value.Int(i):
-                    if i < 0 or i >= items.length:
-                        throw "array index {i} out of bounds (length {items.length})"
-                    items[i]
+                    let n = items.len()
+                    if i < 0 or i >= n:
+                        throw "array index {i} out of bounds (length {n})"
+                    items.get_at(i)
                 _:
                     throw "array index must be Int, got {idx.type_name()}"
         Value.LabeledArray(_, _):
@@ -2979,11 +3057,12 @@ def Value coerce_declared_value(mut Interpreter interp, Value val, Type ty):
 
 def Value coerce_array_elements(mut Interpreter interp, Value val, Type elem):
     match val:
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             mut [Value] coerced = []
             for item in items:
                 coerced.push(coerce_declared_value(interp, item, elem))
-            Value.Array(coerced)
+            val_array(coerced)
         _: val
 
 
@@ -3421,7 +3500,8 @@ def string format_typed(mut Interpreter interp, Value val, Type ty, string spec)
         Type.Qualified(inner, _): return format_typed(interp, val, inner, spec)
         Type.Array(elem):
             match val:
-                Value.Array(items):
+                Value.Array(arr_inner):
+                    let items = arr_inner.clone_elems()
                     mut parts = []
                     for it in items:
                         parts.push(format_typed(interp, it, elem, spec))
@@ -3691,7 +3771,8 @@ req string debug_value(Interpreter interp, Value val):
                     result = result + debug_value(interp, fields[i])
                     i = i + 1
                 result + ")"
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             var result = "["
             var i = 0
             while i < items.length:
@@ -3741,7 +3822,8 @@ req string display_value(Interpreter interp, Value val):
         Value.Fixed(raw, sg, n, m): fixed_format(FixedFmt(signed = sg, n = n, m = m), raw, -1)
         Value.Float32(f): "{f}"
         Value.Str(s): s
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             var result = "["
             var i = 0
             while i < items.length:
@@ -3890,9 +3972,14 @@ def Value eval_stmt_as_expr(mut Interpreter interp, Stmt stmt):
                 interp.set_pending_return(Value.Nil)
             Value.Nil
         Stmt.If(s):
-            let sig = exec_stmt(interp, Stmt.If(s))
-            signal_to_pending(interp, sig)
-            Value.Nil
+            let sig = exec_if_as_expr(interp, s)
+            match sig:
+                ReturnSignal(value): value
+                YieldSignal(value, _): value
+                ThrowSignal(tv):
+                    interp.set_pending_throw(tv)
+                    Value.Nil
+                _: Value.Nil
         Stmt.Match(s):
             let subject = eval_expr(interp, s.subject)
             eval_match(interp, subject, s.arms)
@@ -4229,7 +4316,7 @@ def Value default_like_value(Value v):
         Value.Float64(_): Value.Float64(0.0)
         Value.Bool(_): Value.Bool(false)
         Value.Str(_): Value.Str("")
-        Value.Array(_): Value.Array([])
+        Value.Array(_): val_array([])
         Value.Dict(_): Value.Dict([])
         Value.Set(_): Value.Set([])
         _: Value.Nil
@@ -4317,18 +4404,25 @@ def void assign_target(mut Interpreter interp, Expr target, Value val):
                 _:
                     throw "cannot assign field on non-object"
         ExprKind.Index(obj_expr, idx_expr):
-            let obj = eval_expr(interp, obj_expr)
+            let obj = eval_expr_borrow(interp, obj_expr)
             let idx = eval_expr(interp, idx_expr)
             match obj:
-                Value.Array(items):
+                Value.Array(arr_inner):
                     match idx:
                         Value.Int(i):
-                            if i < 0 or i >= items.length:
+                            let n = arr_inner.len()
+                            if i < 0 or i >= n:
                                 throw "array index {i} out of bounds"
-                            items[i] = val
+                            let existing = arr_inner.get_at(i)
+                            let coerced_val = coerce_float_literal(existing, val)
+                            if not arr_inner.is_shared():
+                                arr_inner.set_at(i, coerced_val)
+                                return
+                            var items = arr_inner.clone_elems()
+                            items[i] = coerced_val
+                            assign_target(interp, obj_expr, val_array(items))
                         _:
                             throw "array index must be Int"
-                    assign_target(interp, obj_expr, Value.Array(items))
                 Value.Dict(entries):
                     var new_entries = entries
                     var found = false
@@ -4409,7 +4503,7 @@ def Value default_value_for_type(Type ty):
         Type.Bool: Value.Bool(false)
         Type.Str: Value.Str("")
         Type.Optional(_): Value.Nil
-        Type.Array(_): Value.Array([])
+        Type.Array(_): val_array([])
         Type.ArrayN(elem_ty, n):
             mut [Value] items = []
             let elem_default = default_value_for_type(elem_ty)
@@ -4417,7 +4511,7 @@ def Value default_value_for_type(Type ty):
             while i < n:
                 items.push(elem_default)
                 i = i + 1
-            Value.Array(items)
+            val_array(items)
         Type.Dict(_, _): Value.Dict([])
         Type.Set(_): Value.Set([])
         Type.Tuple(elems): Value.Tuple(elems.map((e): default_value_for_type(e)))

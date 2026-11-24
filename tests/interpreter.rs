@@ -55,3 +55,4 @@ interpreter_test!(stdlib);
 interpreter_test!(eval);
 interpreter_test!(exec);
 interpreter_test!(json);
+interpreter_test!(ecs_runtime);

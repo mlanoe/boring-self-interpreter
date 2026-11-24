@@ -3,7 +3,7 @@
 `boring` has two ways to run a program: the transpiler (`boring build`, the functional reference)
 and a tree-walk interpreter (`boring run`). This project adds a third, an interpreter written in
 Boring itself. This document says what is measured, how, what the architecture looks like, and
-which gaps remain. Last update: 2026-11-15.
+which gaps remain. Last update: 2026-11-28.
 
 ## What is measured
 
@@ -12,8 +12,8 @@ which gaps remain. Last update: 2026-11-15.
 
 | corpus | selection | rust (`boring run`) | this interpreter |
 |---|---|---:|---:|
-| registered | the 379 simple `transpile_test!` fixtures of `tests/transpile.rs` that have `.br` + `.expected` | 378 ok | 379 ok |
-| unregistered (`--unregistered`) | the 86 other `tests/cases/*.br` with an `.expected` file | 86 ok | 84 ok, 2 timeout |
+| registered | the 392 simple `transpile_test!` fixtures of `tests/transpile.rs` that have `.br` + `.expected` | 390 ok, 2 error | 390 ok, 2 error |
+| unregistered (`--unregistered`) | the 86 other `tests/cases/*.br` with an `.expected` file | 86 ok | 86 ok |
 
 The numbers measure these corpora, not a percentage of the language. A timeout is a case to
 diagnose, not proof of an infinite loop. Project tests, negative tests, GPU targets and calls to
@@ -39,7 +39,8 @@ Choices that stay simpler than the generated Rust:
   each element can be O(n·m). A hash table would need a `Hash`/`Eq` contract for every recursive
   and dynamic `Value`.
 - Channels are arrays with removal at the head (O(n)), not a `VecDeque`.
-- Relative file imports work; `[deps]` and `BORING_PATH` do not, and `use boring.<module>` is
+- Relative file imports, project `src/` discovery, `BORING_PATH`, and local `boring.toml [deps]`
+  (including transitive path deps) work; `git` `[deps]` do not, and `use boring.<module>` is
   resolved against the `stdlib/` of the directory the interpreter runs from.
 
 ### Mechanisms worth knowing
@@ -68,13 +69,12 @@ Choices that stay simpler than the generated Rust:
 
 ## Known gaps (unregistered corpus)
 
-Both fixtures below pass with `boring run`; 84 of the 86 unregistered ones pass with this interpreter.
+All 86 unregistered fixtures now pass with this interpreter (0 errors, 0 output diffs, 0 timeouts):
 
-| case | what is missing |
-|---|---|
-| `kernel_aux_method_return_type_first`, `kernel_sim_many_threads_big_field` | Performance, not semantics: each builds a 30 000-element array with `for i in 0..<30000: b.push(..)`. Here `push` copies the whole array (the environment holds values, not references), so the loop alone costs about 450 million value copies, minutes in a debug build. The kernel part (see below) is not the cost: a 256-thread launch with an empty body is as slow. Fixing it needs an in-place `push`, which the environment's by-value storage does not allow without redesign |
+- **CoW arrays (`ArrayInner'actor`) & direct `Range` iteration** closed the two previous performance timeouts (`kernel_aux_method_return_type_first`, `kernel_sim_many_threads_big_field`): `push`, `pop`, `remove`, and indexed writes mutate unshared arrays in-place in O(1), while `exec_for` iterates `Range` directly without materializing a `[Value]` vector.
+- **ECS syntax, native runtime & `ArrayN` defaults**: `data`, `component`, `resource`, `sync` (as `Stmt.Comment("sync")` kernel barrier), `where` query clauses, ECS `for` loops, and `query` (`EcsFetch`) are parsed; fixed-size `[T, N]` struct/kernel fields auto-initialize to `N` default elements; and `ecs_runtime.br` executes `@component`/`@resource`/`@game`/`@require`/`@schedule`/`@state`/`@after`/`@before`/`On<E>` observers, `commands`, `despawn()`, free per-entity systems, and `use boring.ecs.*`.
 
-The 21 gaps closed since the first audit, by family:
+The 21+ gaps closed since the first audit, by family:
 
 - **Parsing**: `Fn(args)` closure types, `{{` before `$"..."`, `[..<n]` / `[..=n]` allocation, a function-typed parameter keeps a function type.
 - **Storage by value**: a bare struct variable stored into a dict, field, constructor argument or collection is copied unless the destination slot is typed `'actor`/`'shared` or the binding is; a by-value parameter is always copied; `.clone()` of a `'actor` binding aliases.

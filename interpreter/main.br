@@ -12,6 +12,7 @@ use methods
 use exec
 use eval
 use stdlib
+use ecs_runtime
 use json
 
 # == MAIN ==
@@ -106,6 +107,121 @@ def string resolve_project_main() throws:
                 main_file = v
     main_file
 
+# Splits BORING_PATH on `;` (Windows) or `:` (Unix, preserving `C:\...` drive colons).
+def [string] split_boring_path(string raw):
+    if raw.length == 0:
+        return []
+    if raw.contains(";"):
+        return raw.split(";")
+    if raw.contains(":"):
+        let first_colon = raw.indexOf(":") else -1
+        if first_colon != 1 or raw.slice(2, raw.length).contains(":"):
+            return raw.split(":")
+    [raw]
+
+# Collapses `.` and `seg/..` segments in a slash-normalized path.
+def string normalize_rel_path(string path):
+    let norm = path.replace("\\", "/")
+    let has_drive = norm.length >= 2 and norm.slice(1, 2) == ":"
+    let is_abs = norm.startsWith("/") or has_drive
+    mut [string] stack = []
+    for part in norm.split("/"):
+        if part.length == 0 or part == ".":
+            continue
+        if part == "..":
+            if stack.length > 0 and stack[stack.length - 1] != "..":
+                stack.remove(stack.length - 1)
+            elif not is_abs:
+                stack.push("..")
+        else:
+            stack.push(part)
+    if norm.startsWith("/"):
+        return "/" + stack.join("/")
+    if stack.length == 0:
+        return "."
+    stack.join("/")
+
+# Walks up from `source_path` (or CWD if relative/stdin) looking for `boring.toml`.
+def string? find_project_root(string? source_path):
+    var bool check_cwd_parents = true
+    if let sp = source_path:
+        let norm = sp.replace("\\", "/")
+        let has_drive = norm.length >= 2 and norm.slice(1, 2) == ":"
+        if norm.startsWith("/") or has_drive:
+            check_cwd_parents = false
+        var string dir = if fs.isDir(norm.clone()): norm else: use_dirname(norm)
+        while dir.length > 0:
+            if fs.isFile(use_join_path(dir.clone(), "boring.toml")):
+                return dir
+            let parent = use_dirname(dir.clone())
+            if parent == dir:
+                break
+            dir = parent
+        if fs.isFile("boring.toml"):
+            return "."
+    if check_cwd_parents:
+        if fs.isFile("boring.toml"):
+            return "."
+        var string up = ".."
+        var int depth = 0
+        while depth < 16 and fs.isDir(up.clone()):
+            if fs.isFile(use_join_path(up.clone(), "boring.toml")):
+                return up
+            up = "../" + up
+            depth = depth + 1
+    nil
+
+# Extracts a local `path` from a `[deps]` value (`"../dep"` or `{ path = "../dep", ... }`).
+def string? parse_dep_path_value(string raw):
+    let v = raw.trim()
+    if v.length >= 2 and v.startsWith("\"") and v.endsWith("\""):
+        return v.slice(1, v.length - 1)
+    if v.startsWith("{{") and v.endsWith("}}"):
+        let inner = v.slice(1, v.length - 1)
+        for entry in inner.split(","):
+            let kv = entry.trim()
+            if kv.startsWith("path"):
+                let eq = kv.indexOf("=") else -1
+                if eq >= 0:
+                    let rhs = kv.slice(eq + 1, kv.length).trim()
+                    if rhs.length >= 2 and rhs.startsWith("\"") and rhs.endsWith("\""):
+                        return rhs.slice(1, rhs.length - 1)
+    nil
+
+# Parses `[deps]` from `<root_dir>/boring.toml` recursively into `interp.deps`.
+def void resolve_toml_deps(mut Interpreter interp, string root_dir, mut [string] visited):
+    let norm_root = normalize_rel_path(root_dir.clone())
+    if visited.contains(norm_root):
+        return
+    visited.push(norm_root.clone())
+    let toml_path = use_join_path(norm_root.clone(), "boring.toml")
+    if not fs.isFile(toml_path):
+        return
+    let content = fs.read(toml_path)
+    var bool in_deps = false
+    for raw_line in content.split("\n"):
+        let line = raw_line.trim()
+        if line.length == 0 or line.startsWith("#"):
+            continue
+        if line.startsWith("[") and line.endsWith("]"):
+            in_deps = line == "[deps]"
+            continue
+        if not in_deps:
+            continue
+        let eq = line.indexOf("=") else -1
+        if eq <= 0:
+            continue
+        let name = line.slice(0, eq).trim()
+        let raw_val = line.slice(eq + 1, line.length).trim()
+        if name == "std" or name == "crate" or name == "boring":
+            error "'{name}' is a reserved name and cannot be used as a [deps] dependency name"
+            exit(1)
+        if let dep_rel = parse_dep_path_value(raw_val):
+            let dep_root = normalize_rel_path(use_join_path(norm_root.clone(), dep_rel))
+            let dep_src = use_join_path(dep_root.clone(), "src")
+            interp.add_dep(name, dep_src)
+            resolve_toml_deps(interp, dep_root, visited)
+
 def void main() throws:
     let raw = raw_args()
     if raw.length > 1 and (raw[1] == "--help" or raw[1] == "-h"):
@@ -144,13 +260,22 @@ def void main() throws:
     for a in parsed.script_args:
         full_args.push(a)
     interp.cli_args = full_args
-    # Seed `use` resolution with the entry file's own directory — mirrors the
-    # real compiler's `run_file` adding `path.parent()` to `search_paths`
-    # (src/main.rs). Unlike the real compiler, this doesn't also add the
-    # project's `src/` dir or `BORING_PATH` entries — see exec_use in
-    # stdlib.br for the full scope of what's supported here.
-    if let sp = source_path:
+    # Seed `use` resolution with the entry file's directory, the project's
+    # `src/` dir + `boring.toml [deps]`, and `BORING_PATH` entries — matching
+    # `src/main.rs::run_file`.
+    if let sp = source_path.clone():
         let entry_dir = use_dirname(sp)
         if entry_dir.length > 0:
             interp.add_search_path(entry_dir)
+    if let root = find_project_root(source_path):
+        let src_dir = use_join_path(root.clone(), "src")
+        if fs.isDir(src_dir):
+            interp.add_search_path(src_dir)
+        mut [string] visited_deps = []
+        resolve_toml_deps(interp, root, visited_deps)
+    if let bp = environment("BORING_PATH"):
+        for p in split_boring_path(bp):
+            let trimmed = p.trim()
+            if trimmed.length > 0:
+                interp.add_search_path(trimmed)
     run_program(interp, prog)

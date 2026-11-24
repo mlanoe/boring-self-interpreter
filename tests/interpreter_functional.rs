@@ -550,3 +550,439 @@ itest!(exception_propagation);
 fn uncaught_throw() {
     run_file_case_err("uncaught_throw", "main.br", "unhandled exception in main: boom");
 }
+
+#[test]
+fn project_deps_and_boring_path() {
+    let root = std::env::temp_dir().join(format!("boring_self_deps_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("dep_c/src")).unwrap();
+    std::fs::write(root.join("dep_c/src/leaf.br"), "pub def int leaf_val(): 40\n").unwrap();
+    std::fs::create_dir_all(root.join("dep_a/src")).unwrap();
+    std::fs::write(root.join("dep_a/boring.toml"), "[deps]\ndep_c = \"../dep_c\"\n").unwrap();
+    std::fs::write(
+        root.join("dep_a/src/math.br"),
+        "use dep_c.leaf.leaf_val\npub def int add_leaf(int x): x + leaf_val()\n",
+    ).unwrap();
+    std::fs::create_dir_all(root.join("dep_b/src")).unwrap();
+    std::fs::write(root.join("dep_b/src/greet.br"), "pub def string hi(): \"ok\"\n").unwrap();
+    std::fs::create_dir_all(root.join("bpath")).unwrap();
+    std::fs::write(root.join("bpath/extra.br"), "pub def int two(): 2\n").unwrap();
+    std::fs::create_dir_all(root.join("app/src")).unwrap();
+    std::fs::create_dir_all(root.join("app/test")).unwrap();
+    std::fs::write(
+        root.join("app/boring.toml"),
+        "[deps]\ndep_a = \"../dep_a\"\ndep_b = { path = \"../dep_b\" }\n",
+    ).unwrap();
+    std::fs::write(root.join("app/src/local_mod.br"), "pub def int local_v(): 100\n").unwrap();
+    std::fs::write(
+        root.join("app/test/run.br"),
+        "use local_mod.*\nuse dep_a.math.add_leaf\nuse dep_b.greet.*\nuse extra.two\ndef void main():\n    print \"{local_v() + add_leaf(0) + two()} {hi()}\"\n",
+    ).unwrap();
+
+    for (mode, threading, rust_dir) in MODES {
+        let label = format!("{}+{}", mode, threading);
+        let bin = find_bin_in(rust_dir);
+        let out = wait_for_interpreter(
+            Command::new(&bin)
+                .arg(root.join("app/test/run.br"))
+                .env("BORING_PATH", root.join("bpath"))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("cannot spawn interpreter"),
+        );
+        assert!(
+            out.status.success(),
+            "[project_deps_and_boring_path@{}] failed:\n{}",
+            label,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert_eq!(actual.trim_end(), "142 ok", "[project_deps_and_boring_path@{}]", label);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn native_ecs_game_loop() {
+    let ecs_src = r#"@component
+data Position:
+    var float x = 0.0
+    var float y = 0.0
+
+    @schedule(Update)
+    def movement(Velocity vel) where not Frozen:
+        self.x += vel.dx * time.delta
+        self.y += vel.dy * time.delta
+
+@component
+data Velocity:
+    float dx = 0.0
+    float dy = 0.0
+
+@component
+data Frozen:
+    pass
+
+@component
+data Enemy:
+    var int hp = 10
+
+@resource
+data Score:
+    var int count = 0
+
+@game
+data MiniGame:
+    string title = "Mini ECS"
+
+@schedule(Startup)
+def setup():
+    commands.spawn((Position(x = 0.0, y = 0.0), Velocity(dx = 100.0, dy = 50.0)))
+    commands.spawn((Position(x = 5.0, y = 5.0), Velocity(dx = 10.0, dy = 10.0), Frozen()))
+    commands.spawn((Enemy(hp = 0),))
+
+@schedule(Update)
+def check_enemies(mut Score score):
+    for entity, Enemy e:
+        if e.hp <= 0:
+            score.count += 1
+            despawn()
+
+@schedule(PostUpdate)
+def report(Score score):
+    let p = query single (Position) where not Frozen
+    let any_enemy = query any where Enemy
+    print("moved=({p.x:.1}, {p.y:.1}) score={score.count} any_enemy={any_enemy}")
+"#;
+    for (mode, threading, rust_dir) in MODES {
+        let label = format!("{}+{}", mode, threading);
+        let bin = find_bin_in(rust_dir);
+        let mut child = Command::new(&bin)
+            .current_dir(common::boring_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot spawn interpreter");
+        child.stdin.as_mut().unwrap().write_all(ecs_src.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = wait_for_interpreter(child);
+        assert!(
+            out.status.success(),
+            "[native_ecs_game_loop@{}] failed:\n{}",
+            label,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert_eq!(actual.trim_end(), "moved=(1.6, 0.8) score=1 any_enemy=false", "[native_ecs_game_loop@{}]", label);
+    }
+}
+
+#[test]
+fn advanced_ecs_features() {
+    let adv_src = r#"enum GameState:
+    Menu
+    Playing
+
+@component
+data Item:
+    var int val = 0
+
+@resource
+data Log:
+    var string text = ""
+
+struct Ping as Event:
+    int code = 0
+
+@game
+data AdvGame:
+    string title = "Advanced"
+
+@schedule(Startup)
+def init_world():
+    commands.spawn((Item(val = 10),))
+
+@schedule(Update)
+@after(step_one)
+def step_two(mut Log log):
+    log.text = "{log.text}2"
+    commands.trigger(Ping(code = 42))
+
+@schedule(Update)
+def step_one(mut Log log):
+    log.text = "{log.text}1"
+
+@schedule(Update)
+@state(GameState.Playing)
+def only_in_playing(mut Log log):
+    log.text = "{log.text}P"
+
+@schedule(Update)
+@state(GameState.Menu)
+@after(step_two)
+def only_in_menu(mut Log log):
+    log.text = "{log.text}M"
+
+pub def on_ping(On<Ping> ev, mut Log log):
+    log.text = "{log.text}[ping:{ev.event.code}]"
+
+@schedule(PostUpdate)
+def check_added(Log log):
+    let added_count = query (Item) where added Item
+    print("log={log.text} added={added_count.count()}")
+"#;
+    for (mode, threading, rust_dir) in MODES {
+        let label = format!("{}+{}", mode, threading);
+        let bin = find_bin_in(rust_dir);
+        let mut child = Command::new(&bin)
+            .current_dir(common::boring_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot spawn interpreter");
+        child.stdin.as_mut().unwrap().write_all(adv_src.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = wait_for_interpreter(child);
+        assert!(
+            out.status.success(),
+            "[advanced_ecs_features@{}] failed:\n{}",
+            label,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert_eq!(actual.trim_end(), "log=12[ping:42]M added=1", "[advanced_ecs_features@{}]", label);
+    }
+}
+
+#[test]
+fn stdlib_boring_ecs_direct_import() {
+    let direct_src = r#"use boring.ecs.*
+
+struct Pos as Component:
+    var float32 x = 0.0
+    var float32 y = 0.0
+
+def void main() throws:
+    mut world = World()
+    let e = world.spawnEmpty()
+    let p'shared = Pos(x = 3.0, y = 4.0)
+    world.insertComponent(e, "Pos", p)
+    let ents = world.queryEntities(["Pos"], [])
+    print("entities={ents.count()}")
+"#;
+    for (mode, threading, rust_dir) in MODES {
+        let label = format!("{}+{}", mode, threading);
+        let bin = find_bin_in(rust_dir);
+        let mut child = Command::new(&bin)
+            .current_dir(common::boring_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot spawn interpreter");
+        child.stdin.as_mut().unwrap().write_all(direct_src.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = wait_for_interpreter(child);
+        assert!(
+            out.status.success(),
+            "[stdlib_boring_ecs_direct_import@{}] failed:\n{}",
+            label,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert_eq!(actual.trim_end(), "entities=1", "[stdlib_boring_ecs_direct_import@{}]", label);
+    }
+}
+
+#[test]
+fn ecs_late_insert_despawn_writeback_and_free_systems() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "late_insert",
+            "f=1 newly_buffed=0\nf=2 newly_buffed=1\nf=3 newly_buffed=0",
+            r#"@component
+data Tracked:
+    pass
+@component
+data Buffed:
+    pass
+@resource
+data SimState:
+    var int frame = 0
+@game
+data LateInsertGame:
+    string title = "LI"
+@schedule(Startup)
+def setup():
+    commands.spawn((Tracked(),))
+@schedule(Update)
+def tick(mut SimState sim):
+    sim.frame += 1
+@schedule(Update)
+@after(tick)
+def apply_buff(SimState sim):
+    if sim.frame == 2:
+        let e = query first (Entity) where Tracked
+        commands.entity(e).insert(Buffed())
+@schedule(PostUpdate)
+def report(SimState sim):
+    let newly_buffed = query (Buffed) where added Buffed
+    print("f={sim.frame} newly_buffed={newly_buffed.count()}")
+"#,
+        ),
+        (
+            "despawn_cmd",
+            "f=1 alive=1\nf=2 alive=1\nf=3 alive=1",
+            r#"@component
+data Tracked:
+    pass
+@component
+data Doomed:
+    pass
+@resource
+data SimState:
+    var int frame = 0
+@game
+data DespawnGame:
+    string title = "DE"
+@schedule(Startup)
+def setup():
+    commands.spawn((Tracked(), Doomed()))
+    commands.spawn((Tracked(),))
+@schedule(Update)
+def tick(mut SimState sim):
+    sim.frame += 1
+@schedule(Update)
+@after(tick)
+def reap(SimState sim):
+    if sim.frame == 1:
+        let e = query first (Entity) where Doomed
+        commands.entity(e).despawn()
+@schedule(PostUpdate)
+def report(SimState sim):
+    let alive = query (Tracked) where Tracked
+    print("f={sim.frame} alive={alive.count()}")
+"#,
+        ),
+        (
+            "fetch_writeback",
+            "f=1 a=1 b=1 c=0\nf=2 a=2 b=2 c=1\nf=3 a=3 b=3 c=2",
+            r#"@component
+data TrackedA:
+    pass
+@component
+data TrackedB:
+    pass
+@component
+data TrackedC:
+    pass
+@component
+data CounterA:
+    var int n = 0
+@component
+data CounterB:
+    var int n = 0
+@component
+data CounterC:
+    var int n = 0
+@resource
+data SimState:
+    var int frame = 0
+@game
+data WBGame:
+    string title = "WB"
+@schedule(Startup)
+def setup():
+    commands.spawn((TrackedA(), CounterA(n = 0)))
+    commands.spawn((TrackedB(), CounterB(n = 0)))
+    commands.spawn((TrackedC(), CounterC(n = 0)))
+@schedule(Update)
+def tick(mut SimState sim):
+    sim.frame += 1
+@schedule(Update)
+@after(tick)
+def bump_first(mut SimState sim):
+    mut a = query first (mut CounterA) where TrackedA
+    a.n += 1
+@schedule(Update)
+@after(tick)
+def bump_any(mut SimState sim):
+    mut b = query any (mut CounterB) where TrackedB
+    b.n += 1
+@schedule(Update)
+@after(tick)
+def bump_nested(SimState sim):
+    if sim.frame >= 2:
+        mut c = query first (mut CounterC) where TrackedC
+        c.n += 1
+@schedule(PostUpdate)
+def report(SimState sim):
+    let a = query single (CounterA) where TrackedA
+    let b = query single (CounterB) where TrackedB
+    let c = query single (CounterC) where TrackedC
+    print("f={sim.frame} a={a.n} b={b.n} c={c.n}")
+"#,
+        ),
+        (
+            "free_per_entity_and_require",
+            "changed=2 x=10\nchanged=1 x=13",
+            r#"@component
+data Transform:
+    var int x = 7
+@component
+@require(Transform)
+data Sprite:
+    var int w = 10
+@component
+data Frozen:
+    pass
+@game
+data FreeSysGame:
+    string title = "FS"
+@schedule(Startup)
+def setup(Commands cmds):
+    cmds.spawn((Sprite(w = 3),))
+    cmds.spawn((Sprite(w = 5), Frozen()))
+@schedule(Update)
+def step(mut Transform t, Sprite s) where not Frozen:
+    t.x += s.w
+@schedule(PostUpdate)
+def report():
+    let changed = query (Transform) where changed Transform
+    let unfrozen = query single (Transform) where not Frozen
+    print("changed={changed.count()} x={unfrozen.x}")
+"#,
+        ),
+    ];
+
+    for (name, expected, src) in cases {
+        let frames = if *name == "free_per_entity_and_require" { "2" } else { "3" };
+        for (mode, threading, rust_dir) in MODES {
+            let label = format!("{}+{}", mode, threading);
+            let bin = find_bin_in(rust_dir);
+            let mut child = Command::new(&bin)
+                .current_dir(common::boring_dir())
+                .env("BORING_ECS_FRAMES", frames)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("cannot spawn interpreter");
+            child.stdin.as_mut().unwrap().write_all(src.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let out = wait_for_interpreter(child);
+            assert!(
+                out.status.success(),
+                "[ecs:{}@{}] failed:\n{}",
+                name,
+                label,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let actual = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+            assert_eq!(actual.trim_end(), *expected, "[ecs:{}@{}]", name, label);
+        }
+    }
+}

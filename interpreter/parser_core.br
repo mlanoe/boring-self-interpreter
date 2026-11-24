@@ -479,7 +479,40 @@ def bool parser_peek_is_trailing_closure_no_paren(mut Parser p):
     false
 
 def bool parser_peek_is_typed_closure(mut Parser p) throws:
-    parser_is_type_start_before_ident(p)
+    if parser_peek_ident(p) == "query":
+        var qi = 1
+        while qi < 20:
+            let qk = token_kind_name(parser_peek_token_at(p, qi).kind)
+            if qk == "In":
+                return false
+            if qk == "RParen" or qk == "Colon" or qk == "Newline" or qk == "Eof":
+                break
+            qi = qi + 1
+    if not parser_is_type_start_before_ident(p):
+        return false
+    var ci = 0
+    var depth = 1
+    while depth > 0 and ci < 120:
+        let ck = token_kind_name(parser_peek_token_at(p, ci).kind)
+        if ck == "Eof":
+            return false
+        if ck == "LParen":
+            depth = depth + 1
+        elif ck == "RParen":
+            depth = depth - 1
+            if depth == 0:
+                break
+        ci = ci + 1
+    if depth != 0:
+        return false
+    var ai = ci + 1
+    while ai < ci + 5:
+        let ak = token_kind_name(parser_peek_token_at(p, ai).kind)
+        if ak == "Throws" or ak == "Task":
+            ai = ai + 1
+        else:
+            return ak == "Colon"
+    false
 
 def bool parser_peek_starts_expr(mut Parser p) throws:
     let name = token_kind_name(p.peek())
@@ -593,7 +626,7 @@ def bool parser_is_type_start_before_ident(mut Parser p):
         var scan = 2
         while true:
             let ks = token_kind_name(parser_peek_token_at(p, scan).kind)
-            if ks == "Ident" or ks == "Guard" or ks == "Mut" or ks == "Req":
+            if ks == "Ident" or ks == "Guard" or ks == "Mut" or ks == "Req" or ks == "Static" or ks == "Kernel":
                 scan = scan + 1
                 let kn = token_kind_name(parser_peek_token_at(p, scan).kind)
                 if kn == "Tick":
@@ -691,8 +724,12 @@ def bool parser_is_fn_shorthand(mut Parser p) throws:
             if tuple_tok == "RParen":
                 tuple_depth = tuple_depth - 1
                 if tuple_depth == 0:
-                    let name_off = tuple_i + 1
-                    let lparen_off = tuple_i + 2
+                    var name_off = tuple_i + 1
+                    while parser_token_at_offset_is(p, name_off, "Tick"):
+                        name_off = name_off + 2
+                    if parser_token_at_offset_is(p, name_off, "Question"):
+                        name_off = name_off + 1
+                    let lparen_off = name_off + 1
                     if not parser_token_at_offset_is(p, name_off, "Ident") or not parser_token_at_offset_is(p, lparen_off, "LParen"):
                         return false
                     let params_off = lparen_off + 1
@@ -761,20 +798,26 @@ def bool parser_is_fn_shorthand(mut Parser p) throws:
             if p0 == "Var" or p0 == "Mut": return true
             if p0 == "LParen" and parser_paren_group_then_ident(p, params_off): return true
             return parser_paren_list_then_colon(p, lparen_off)
-    # Pattern: [ ... ] [Question] Ident LParen → array return type
-    if parser_token_at_offset_is(p, 0, "LBracket"):
+    # Pattern: [ ... ] ['qual]* [Question] Ident LParen → array return type
+    # Pattern: { ... } ['qual]* [Question] Ident LParen → dict/set return type
+    if parser_token_at_offset_is(p, 0, "LBracket") or parser_token_at_offset_is(p, 0, "LBrace"):
+        let open_k = if parser_token_at_offset_is(p, 0, "LBracket"): "LBracket" else: "LBrace"
+        let close_k = if open_k == "LBracket": "RBracket" else: "RBrace"
         var depth = 0
         var i = 0
         var found = false
-        while i < 20 and not found:
+        while i < 30 and not found:
             let tok = token_kind_name(parser_peek_token_at(p, i).kind)
-            if tok == "LBracket": depth = depth + 1
-            if tok == "RBracket":
+            if tok == open_k: depth = depth + 1
+            if tok == close_k:
                 depth = depth - 1
                 if depth == 0:
                     found = true
-                    let has_q = parser_token_at_offset_is(p, i + 1, "Question")
-                    let name_off = if has_q: i + 2 else: i + 1
+                    var after_col = i + 1
+                    while parser_token_at_offset_is(p, after_col, "Tick"):
+                        after_col = after_col + 2
+                    let has_q = parser_token_at_offset_is(p, after_col, "Question")
+                    let name_off = if has_q: after_col + 1 else: after_col
                     let lparen_off = name_off + 1
                     if parser_token_at_offset_is(p, name_off, "Ident") and parser_token_at_offset_is(p, lparen_off, "LParen"):
                         let after_lparen = lparen_off + 1
@@ -937,8 +980,13 @@ def Type parse_type_base(mut Parser p) throws:
                 "bool":  Type.Bool
                 "void":  Type.Void
                 _:
-                    # Handle generic type params: `Result<int, string>` — skip them
+                    # Handle generic type params: `Result<int, string>` — keep `On<E>`/`Trigger<E>` for ECS observers
                     if p.peek() == TokenKind.Lt:
+                        if s == "On" or s == "Trigger":
+                            _ = p.advance()
+                            let inner_ev = parse_type(p)
+                            _ = p.expect(TokenKind.Gt)
+                            return Type.Generic(s, [inner_ev])
                         _ = p.advance()
                         var d = 1
                         while d > 0 and p.peek() != TokenKind.Eof:
@@ -1378,6 +1426,8 @@ def StructDecl parse_struct_decl(mut Parser p, bool is_pub) throws:
         _ = p.eat(TokenKind.Newline)
         return StructDecl(name= name, fields= [], methods= [], inits= [], line= line, is_pub= is_pub, is_native= false, protocols= struct_protocols, conversions= [], type_params= [], where_clause= [], setters= [], type_methods= [], type_vars= [], assoc_type_defs= [], attrs= decl_attrs)
     _ = p.expect(TokenKind.Newline)
+    while parser_check(p, "Comment") or parser_check(p, "Newline"):
+        _ = p.advance()
     _ = p.expect(TokenKind.Indent)
     mut fields = [FieldDecl]{}
     mut methods = [FnDecl]{}
@@ -1575,6 +1625,8 @@ def EnumDecl parse_enum_decl(mut Parser p, bool is_pub) throws:
         _ = p.eat(TokenKind.Newline)
         return EnumDecl(name= name, variants= [], methods= [], type_methods= [], is_pub= is_pub, conversions= [], type_params= [], line= line, is_native= false, protocols= [], setters= [], attrs= decl_attrs)
     _ = p.expect(TokenKind.Newline)
+    while parser_check(p, "Comment") or parser_check(p, "Newline"):
+        _ = p.advance()
     _ = p.expect(TokenKind.Indent)
     mut variants = [EnumVariant]{}
     mut methods = [FnDecl]{}
@@ -1714,6 +1766,8 @@ def StructDecl parse_view_decl(mut Parser p, bool is_pub) throws:
                 p.advance()
     _ = p.expect(TokenKind.Colon)
     _ = p.expect(TokenKind.Newline)
+    while parser_check(p, "Comment") or parser_check(p, "Newline"):
+        _ = p.advance()
     _ = p.expect(TokenKind.Indent)
     mut fields = [FieldDecl]{}
     mut state_fields = [FieldDecl]{}
@@ -1850,6 +1904,8 @@ def string attr_token_text(Token t):
         TokenKind.Str(s): "\"{s}\""
         TokenKind.Int(n): "{n}"
         TokenKind.Eq: "="
+        TokenKind.Dot: "."
+        TokenKind.Colon: ":"
         _: t.text()
 
 # Reads `@name` / `@name(arg, arg)` lines (any number) and returns them.
@@ -2606,7 +2662,29 @@ def WhileStmt make_while_stmt(Expr condition, [Stmt] body, int line):
     WhileStmt(condition= condition, body= body, line= line)
 
 def ForStmt make_for_stmt([string] vars, Expr iterable, Expr? key, Expr? where_expr, [Stmt] body, int line):
-    ForStmt(vars= vars, iterable= iterable, key= key, where_expr= where_expr, body= body, line= line)
+    ForStmt(vars= vars, iterable= iterable, key= key, where_expr= where_expr, body= body, line= line, ecs_types= [], ecs_muts= [], ecs_options= [], ecs_where= [])
+
+def ForStmt make_ecs_for_stmt([string] vars, [string?] ecs_types, [bool] ecs_muts, [bool] ecs_options, [{string=string}] ecs_where, [Stmt] body, int line):
+    ForStmt(vars= vars, iterable= Expr(kind= ExprKind.Hole, line= line), key= nil, where_expr= nil, body= body, line= line, ecs_types= ecs_types, ecs_muts= ecs_muts, ecs_options= ecs_options, ecs_where= ecs_where)
+
+def string? ecs_type_base_name(Type ty):
+    match ty:
+        Type.Optional(inner): ecs_type_base_name(inner)
+        Type.Qualified(inner, _): ecs_type_base_name(inner)
+        Type.Named(n):
+            let parts = n.split("<")
+            parts[0].trim()
+        Type.Generic(n, _): n
+        _: nil
+
+def bool ecs_is_optional_type(Type ty):
+    match ty:
+        Type.Optional(_): true
+        Type.Qualified(inner, _): ecs_is_optional_type(inner)
+        _: false
+
+def Expr make_ecs_fetch_expr(QueryKind kind, bool is_optional, [EcsFetchComponent] components, [{string=string}] where_clause, int line):
+    Expr(kind= ExprKind.EcsFetch(EcsFetchExpr(kind= kind, is_optional= is_optional, components= components, where_clause= where_clause, line= line)), line= line)
 
 def Expr make_query_expr(QueryKind kind, bool is_optional, [string] vars, Expr iterable, Expr? where_clause, Expr? projection, int line):
     Expr(kind= ExprKind.Query(QueryExpr(kind= kind, is_optional= is_optional, vars= vars, iterable= iterable, where_clause= where_clause, projection= projection, line= line)), line= line)
@@ -3029,6 +3107,8 @@ def ModDecl parse_mod_decl(mut Parser p, bool is_pub) throws:
     let name = parser_expect_ident(p)
     _ = p.expect(TokenKind.Colon)
     _ = p.expect(TokenKind.Newline)
+    while parser_check(p, "Comment") or parser_check(p, "Newline"):
+        _ = p.advance()
     _ = p.expect(TokenKind.Indent)
     mut items = [Item]{}
     while p.peek() != TokenKind.Dedent and p.peek() != TokenKind.Eof:
@@ -3428,7 +3508,7 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
     if name == "len":
         let v = args[0] else Value.Nil
         match v:
-            Value.Array(items): return Value.Int(items.length)
+            Value.Array(items): return Value.Int(items.len())
             Value.Str(s): return Value.Int(s.length)
             Value.Dict(pairs): return Value.Int(pairs.length)
             _: throw "len: unsupported type"
@@ -3622,7 +3702,7 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
         mut [Value] out = []
         for a in interp.cli_args:
             out.push(Value.Str(a))
-        return Value.Array(out)
+        return val_array(out)
     if name == "environment":
         # One Unicode process-environment variable; a missing (or non-Unicode) one is nil,
         # like the `string?` the builtin has under the Rust interpreter and `std::env::var(..).ok()`.
@@ -3643,7 +3723,7 @@ def Value call_native(mut Interpreter interp, string name, Value func, [Value] a
     if name == "HashSet":
         return Value.Set([])
     if name == "Vec":
-        return Value.Array([])
+        return val_array([])
     # `Box(v)`: an opaque deref cell whose `.pointee` is the boxed value.
     if name == "Box":
         var boxed = args[0] else Value.Nil
@@ -3915,47 +3995,55 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
         return Type.Qualified(base, OwnerQual.Inline)
     if p.eat(TokenKind.Req):
         return Type.Qualified(base, OwnerQual.Shared)
-    # Bare tick with no qualifier (e.g. `EColorB'`) — treat as just the base type
-    if not parser_check(p, "Ident"):
-        return base
-    # Only consume the ident if it's a known qualifier keyword
-    let peeked_name = parser_peek_ident(p)
-    if peeked_name != "actor" and peeked_name != "shared" and peeked_name != "guard" and peeked_name != "inline" and peeked_name != "owned" and peeked_name != "weak" and peeked_name != "new" and peeked_name != "one" and peeked_name != "many" and peeked_name != "observed":
-        # A qualifier *parameter* (`Point'elem`, `Board<'q>`): the interpreter is
-        # qualifier-blind, so keep it as an opaque `Lifetime` marker.
-        let pname = parser_expect_ident(p)
-        var lq = Type.Qualified(base, OwnerQual.Lifetime(pname))
-        # Chained suffixes (`q'c'observed`) stay opaque too.
-        while parser_check(p, "Tick") and (token_kind_name(parser_peek_token_at(p, 1).kind) == "Ident" or token_kind_name(parser_peek_token_at(p, 1).kind) == "Guard"):
-            _ = p.eat(TokenKind.Tick)
-            if p.eat(TokenKind.Guard):
-                lq = Type.Qualified(lq, OwnerQual.Guard)
-            else:
-                lq = Type.Qualified(lq, OwnerQual.Lifetime(parser_expect_ident(p)))
-        if p.eat(TokenKind.Question):
-            return Type.Optional(lq)
-        return lq
-    let qual_name = parser_expect_ident(p)
-    let qual = match qual_name:
-        "actor": OwnerQual.Actor
-        "shared": OwnerQual.Shared
-        "guard": OwnerQual.Guard
-        "inline": OwnerQual.Inline
-        "owned": OwnerQual.Owned
-        "new": OwnerQual.Owned
-        "weak": OwnerQual.Weak
-        "one": OwnerQual.Inline
-        "many": OwnerQual.Shared
-        "observed": OwnerQual.Observed
-        _: OwnerQual.Actor
-    var qualified = Type.Qualified(base, qual)
-    # Allow chained qualifiers: 'T'shared'weak
+    var qualified = base
+    if p.eat(TokenKind.Kernel):
+        qualified = Type.Qualified(base, OwnerQual.Actor)
+    else:
+        # Bare tick with no qualifier (e.g. `EColorB'`) — treat as just the base type
+        if not parser_check(p, "Ident"):
+            return base
+        # Only consume the ident if it's a known qualifier keyword
+        let peeked_name = parser_peek_ident(p)
+        if peeked_name != "actor" and peeked_name != "shared" and peeked_name != "guard" and peeked_name != "inline" and peeked_name != "owned" and peeked_name != "weak" and peeked_name != "new" and peeked_name != "one" and peeked_name != "many" and peeked_name != "observed":
+            # A qualifier *parameter* (`Point'elem`, `Board<'q>`): the interpreter is
+            # qualifier-blind, so keep it as an opaque `Lifetime` marker.
+            let pname = parser_expect_ident(p)
+            var lq = Type.Qualified(base, OwnerQual.Lifetime(pname))
+            # Chained suffixes (`q'c'observed`) stay opaque too.
+            while parser_check(p, "Tick") and (token_kind_name(parser_peek_token_at(p, 1).kind) == "Ident" or token_kind_name(parser_peek_token_at(p, 1).kind) == "Guard"):
+                _ = p.eat(TokenKind.Tick)
+                if p.eat(TokenKind.Guard):
+                    lq = Type.Qualified(lq, OwnerQual.Guard)
+                else:
+                    lq = Type.Qualified(lq, OwnerQual.Lifetime(parser_expect_ident(p)))
+            if p.eat(TokenKind.Question):
+                return Type.Optional(lq)
+            return lq
+        let qual_name = parser_expect_ident(p)
+        let qual = match qual_name:
+            "actor": OwnerQual.Actor
+            "shared": OwnerQual.Shared
+            "guard": OwnerQual.Guard
+            "inline": OwnerQual.Inline
+            "owned": OwnerQual.Owned
+            "new": OwnerQual.Owned
+            "weak": OwnerQual.Weak
+            "one": OwnerQual.Inline
+            "many": OwnerQual.Shared
+            "observed": OwnerQual.Observed
+            _: OwnerQual.Actor
+        qualified = Type.Qualified(base, qual)
+    # Allow chained qualifiers: 'T'shared'weak or 'kernel'unified
     while parser_check(p, "Tick"):
         let next_k = token_kind_name(parser_peek_token_at(p, 1).kind)
         if next_k == "Guard":
             _ = p.eat(TokenKind.Tick)
             _ = p.eat(TokenKind.Guard)
             qualified = Type.Qualified(qualified, OwnerQual.Guard)
+        elif next_k == "Kernel":
+            _ = p.eat(TokenKind.Tick)
+            _ = p.eat(TokenKind.Kernel)
+            qualified = Type.Qualified(qualified, OwnerQual.Actor)
         elif next_k == "Task":
             # `'actor'task` / `'guard'task`: which lock implementation backs the handle is
             # a compile-time detail with no runtime effect here.
@@ -3963,7 +4051,7 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
             _ = p.eat(TokenKind.Task)
         elif next_k == "Ident":
             let peek_q = parser_peek_token_at(p, 1).text()
-            if peek_q != "actor" and peek_q != "shared" and peek_q != "guard" and peek_q != "inline" and peek_q != "owned" and peek_q != "weak" and peek_q != "new" and peek_q != "observed":
+            if peek_q != "actor" and peek_q != "shared" and peek_q != "guard" and peek_q != "inline" and peek_q != "owned" and peek_q != "weak" and peek_q != "new" and peek_q != "observed" and peek_q != "unified" and peek_q != "global" and peek_q != "device" and peek_q != "local" and peek_q != "constant":
                 break
             _ = p.eat(TokenKind.Tick)
             let q2_name = parser_expect_ident(p)
@@ -3976,7 +4064,7 @@ def Type parse_type_qualifier(mut Parser p, Type base) throws:
                 "new": OwnerQual.Owned
                 "weak": OwnerQual.Weak
                 "observed": OwnerQual.Observed
-                _: OwnerQual.Weak
+                _: OwnerQual.Actor
             qualified = Type.Qualified(qualified, q2)
         else:
             break

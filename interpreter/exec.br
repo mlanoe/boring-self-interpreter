@@ -333,7 +333,8 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
                                     all_fixed = false
                             if all_fixed:
                                 match val:
-                                    Value.Array(items):
+                                    Value.Array(arr_inner):
+                                        let items = arr_inner.clone_elems()
                                         if items.length != total:
                                             throw "labeled array length mismatch — buffer has {items.length} elements, shape needs {total}"
                                         val = Value.LabeledArray(items, pairs)
@@ -469,7 +470,7 @@ def Signal? exec_stmt(mut Interpreter interp, Stmt stmt):
             var elems = []
             match val:
                 Value.Tuple(items): elems = items
-                Value.Array(items): elems = items
+                Value.Array(arr_inner): elems = arr_inner.clone_elems()
                 _: elems = [val]
             var i = 0
             for binding in s.bindings:
@@ -768,10 +769,37 @@ def Signal? exec_while(mut Interpreter interp, WhileStmt s):
 # ─── exec_for ─────────────────────────────────────────────────────────────────
 
 def Signal? exec_for(mut Interpreter interp, ForStmt s):
-    let iterable = eval_expr(interp, s.iterable)
+    if s.ecs_types.length > 0 or s.ecs_where.length > 0:
+        return exec_ecs_for(interp, s)
+    let iterable = eval_expr_borrow(interp, s.iterable)
     # A throwing call as the iterable (e.g. a `throws` stream method) ends the loop with its error.
     if interp.has_pending_throw:
         return ThrowSignal(interp.take_pending_throw())
+    match iterable:
+        Value.Range(start, end, inclusive, _):
+            if s.vars.length == 1 and s.where_expr == nil:
+                let var_name = s.vars[0]
+                let limit = if inclusive: end + 1 else: end
+                var cur = start
+                var Signal? result = nil
+                var done = false
+                while not done and cur < limit:
+                    mut child = new_env(interp.current_env)
+                    child.define_mut(var_name, Value.Int(cur))
+                    let prev = interp.current_env
+                    interp.current_env = child
+                    let sig = exec_block(interp, s.body)
+                    match sig:
+                        nil: nil
+                        BreakSignal(_): done = true
+                        ContinueSignal: nil
+                        _:
+                            done = true
+                            result = sig
+                    interp.current_env = prev
+                    cur = cur + 1
+                return result
+        _: nil
     let items = collect_iterable_with_interp(interp, iterable)
     var Signal? result = nil
     var idx = 0
@@ -825,7 +853,7 @@ def Signal? exec_for(mut Interpreter interp, ForStmt s):
 
 def [Value] collect_iterable(Value val):
     match val:
-        Array(elems): elems
+        Array(arr_inner): arr_inner.clone_elems()
         Set(elems): elems
         Tuple(elems): elems
         Value.Dict(pairs):
@@ -1127,7 +1155,8 @@ def Value kernel_dim_value(int x, int y, int z):
 # it, and reading an element of a plain array copies the whole array.
 def Value chunk_array(Value arr):
     match arr:
-        Value.Array(items):
+        Value.Array(arr_inner):
+            let items = arr_inner.clone_elems()
             mut [(string, Value)] chunks = [("n", Value.Int(items.length))]
             var start = 0
             var k = 0
@@ -1137,7 +1166,7 @@ def Value chunk_array(Value arr):
                 while j < items.length and j < start + 256:
                     chunk.push(items[j])
                     j = j + 1
-                chunks.push(("c{k}", Value.Array(chunk)))
+                chunks.push(("c{k}", val_array(chunk)))
                 start = start + 256
                 k = k + 1
             Value.Object(ObjectInner(type_name= "__ArrayRef", fields= chunks))
@@ -1153,10 +1182,10 @@ def Value chunked_array_get(ObjectInner'actor chunked_obj, Value idx):
     if at >= 0:
         if let chunk = chunked_obj.get_field(ck):
             match chunk:
-                Value.Array(items):
+                Value.Array(arr_inner):
                     let within = at % 256
-                    if within < items.length:
-                        return items[within]
+                    if within < arr_inner.len():
+                        return arr_inner.get_at(within)
                 _: nil
     throw "array index {at} out of bounds"
 
@@ -1293,10 +1322,15 @@ def Value run_kernel_inner(mut Interpreter interp, Value kself, ObjectInner'acto
     for f in kobj.fields:
         var stored = f.1
         match f.1:
-            Value.Array(big_items):
-                if big_items.length >= 512 and not stmts_may_write(interp, entry.body, f.0):
-                    stored = chunk_array(f.1)
-                    chunked_names.push(f.0)
+            Value.Array(big_inner):
+                if not stmts_may_write(interp, entry.body, f.0):
+                    # Read-only in kernel: ArrayInner'actor already gives O(1) element reads
+                    # without cloning; no need to copy into chunks.
+                    stored = f.1
+                else:
+                    # Written in kernel (e.g. out, tile): give shared its own unshared
+                    # ArrayInner so every thread's index-assign mutates in-place in O(1).
+                    stored = val_array(big_inner.clone_elems())
             _: nil
         shared.define_mut(f.0, stored)
     shared.define_mut("self", kself)
@@ -1487,9 +1521,9 @@ def Value call_fn_body(mut Interpreter interp, FnDecl decl, [Value] args, Env'ac
                 rest.push(positional[pos_idx])
                 pos_idx = pos_idx + 1
             if param.mutable:
-                fn_env.define_mut(param.name, Array(rest))
+                fn_env.define_mut(param.name, val_array(rest))
             else:
-                fn_env.define(param.name, Array(rest))
+                fn_env.define(param.name, val_array(rest))
         else:
             var val = Nil
             if labeled.has(param.name):
@@ -1535,7 +1569,7 @@ def Value call_fn_body(mut Interpreter interp, FnDecl decl, [Value] args, Env'ac
         interp.current_env = prev_env
         if interp.has_pending_throw:
             return Value.Nil
-        return Value.Array(stream_result)
+        return val_array(stream_result)
     let sig = exec_block_fn(interp, decl.body)
     capture_var_param_outs(interp, decl.params, fn_env)
     drop_scope_subscriptions(interp, fn_env, -1)
@@ -1575,7 +1609,7 @@ def Value exec_method_body(mut Interpreter interp, FnDecl decl):
             ThrowSignal(tv):
                 interp.set_pending_throw(tv)
                 return Value.Nil
-            _: return Value.Array(collected)
+            _: return val_array(collected)
     let sig = exec_block_fn(interp, decl.body)
     pop_return_ty(interp)
     match sig:
@@ -1679,7 +1713,7 @@ def Value site_wrap(mut Interpreter interp, Value elem):
     guard let sited = interp.get_struct_decl("Sited") else: return elem
     let site_no = interp.block_site
     interp.block_site = site_no + 1
-    instantiate_struct(interp, sited, [Value.Labeled("site", Value.Int(site_no)), Value.Labeled("children", Value.Array([elem]))])
+    instantiate_struct(interp, sited, [Value.Labeled("site", Value.Int(site_no)), Value.Labeled("children", val_array([elem]))])
 
 # The body of one `for` iteration: its items, grouped under their key when the loop is keyed.
 def [Value] collect_for_iteration(mut Interpreter interp, ForStmt for_stmt, Value item, int site_no):
@@ -1703,7 +1737,7 @@ def [Value] collect_for_iteration(mut Interpreter interp, ForStmt for_stmt, Valu
     if let key = key_opt:
         let keyed_decl_opt = interp.get_struct_decl("KeyedGroup")
         if let keyed_decl = keyed_decl_opt:
-            let group = instantiate_struct(interp, keyed_decl, [Value.Str(display_value(interp, key)), Value.Array(nested)])
+            let group = instantiate_struct(interp, keyed_decl, [Value.Str(display_value(interp, key)), val_array(nested)])
             out.push(site_wrap(interp, group))
         else:
             throw "keyed array block requires a KeyedGroup struct"
@@ -1728,7 +1762,8 @@ def [Value] collect_array_block_stmts(mut Interpreter interp, [Stmt] stmts):
                 let loop_site = interp.block_site
                 var iterations = 0
                 match iterable:
-                    Value.Array(items):
+                    Value.Array(arr_inner):
+                        let items = arr_inner.clone_elems()
                         for item in items:
                             interp.block_site = loop_site
                             let part = collect_for_iteration(interp, for_stmt, item, loop_site)
@@ -1801,6 +1836,8 @@ def Value call_value(mut Interpreter interp, Value callee, [Value] args):
             call_closure(interp, params, body_stmts, args, captured)
 
         Value.NativeFn(name, func):
+            if name == "despawn":
+                return ecs_despawn_builtin(interp, args)
             call_native(interp, name, func, args)
 
         Value.OverloadedFn(name, variants):
@@ -1818,7 +1855,7 @@ def Value call_value(mut Interpreter interp, Value callee, [Value] args):
                             let last_idx = ctor_args.length - 1
                             match ctor_args[last_idx]:
                                 Value.Closure(_, body, captured):
-                                    ctor_args[last_idx] = Value.Labeled(last_field.name, Value.Array(collect_array_block(interp, body, captured)))
+                                    ctor_args[last_idx] = Value.Labeled(last_field.name, val_array(collect_array_block(interp, body, captured)))
                                 _: nil
                         _: nil
                 instantiate_struct(interp, decl, ctor_args)

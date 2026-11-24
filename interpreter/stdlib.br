@@ -32,6 +32,7 @@ struct Interpreter:
     var int observed_next_id = 0
     # `std.net` sockets of the guest program, keyed by the `id` field of their `TcpListener`/`TcpStream` object.
     var Sockets'actor net
+    var EcsState'actor ecs
     # `type let|var` values, keyed "Owner::name"; `in_type_setter` stops a `type set` body re-entering itself.
     var {string=Value} type_var_store = {}
     var bool in_type_setter = false
@@ -46,6 +47,7 @@ struct Interpreter:
     # compiler's `search_paths`/`loaded` (src/interpreter/mod.rs). See
     # `exec_use` below for exactly what's supported.
     var [string] search_paths = []
+    var {string=string} deps = {}
     # A `[string]` (not `{string}`) despite being pure membership-tracking —
     # `set.add(...)` only transpiles to Rust's `HashSet::insert` when the
     # transpiler can track the receiver as a local variable of set type (see
@@ -130,12 +132,37 @@ struct Interpreter:
                     pi = pi + 1
                 if args.length >= min_args and args.length <= max_args:
                     var all_match = true
+                    mut [string] bound_labels = []
+                    for a in args:
+                        match a:
+                            Value.Labeled(label, inner_val):
+                                var found_param = false
+                                for p in decl.params:
+                                    if p.name == label:
+                                        found_param = true
+                                        bound_labels.push(label)
+                                        if let pty = p.ty:
+                                            if not value_matches_type_static(inner_val, pty):
+                                                all_match = false
+                                if not found_param:
+                                    all_match = false
+                            _: nil
+                    var pos_i = 0
                     var i = 0
-                    while i < decl.params.length and i < args.length:
-                        let p = decl.params[i]
-                        if let pty = p.ty:
-                            if not value_matches_type_static(args[i], pty):
-                                all_match = false
+                    while i < args.length and all_match:
+                        match args[i]:
+                            Value.Labeled(_, _): nil
+                            _:
+                                while pos_i < decl.params.length and bound_labels.contains(decl.params[pos_i].name):
+                                    pos_i = pos_i + 1
+                                if pos_i < decl.params.length:
+                                    let p = decl.params[pos_i]
+                                    if let pty = p.ty:
+                                        if not value_matches_type_static(args[i], pty):
+                                            all_match = false
+                                    pos_i = pos_i + 1
+                                else:
+                                    all_match = false
                         i = i + 1
                     if all_match:
                         return decl
@@ -183,6 +210,18 @@ struct Interpreter:
     def void add_search_path(string path):
         if not search_paths.contains(path):
             search_paths.push(path)
+
+    def void add_dep(string name, string src_dir):
+        if not deps.has(name):
+            deps.set(name, src_dir)
+
+    req bool has_dep(string name):
+        deps.has(name)
+
+    req string? get_dep(string name):
+        if deps.has(name):
+            return deps[name]
+        nil
 
     req string? find_module_file(string rel):
         for base in search_paths:
@@ -271,9 +310,10 @@ def string val_to_string(Value v):
         Value.Float32(f): "{f}"
         Value.Str(s): s
         Value.Array(elems):
+            let items = elems.clone_elems()
             mut parts = ["["]
             var first = true
-            for e in elems:
+            for e in items:
                 if not first:
                     parts.push(", ")
                 parts.push(val_to_string(e))
@@ -381,7 +421,7 @@ def bool val_to_bool(Value v):
         Value.Float16(f): f != (0.0 as float16)
         Value.Float32(f): f != 0.0
         Value.Str(s): s != ""
-        Value.Array(elems): elems.length != 0
+        Value.Array(elems): elems.len() != 0
         Value.Dict(pairs): pairs.length != 0
         Value.Set(elems): elems.length != 0
         Value.Tuple(elems): elems.length != 0
@@ -440,13 +480,17 @@ def bool values_equal(Value a, Value b):
         Value.Array(xs):
             match b:
                 Value.Array(ys):
-                    if xs.length != ys.length:
+                    let xlen = xs.len()
+                    let ylen = ys.len()
+                    if xlen != ylen:
                         false
                     else:
                         var i = 0
                         var eq = true
-                        while i < xs.length:
-                            if not values_equal(xs[i], ys[i]):
+                        while i < xlen and eq:
+                            let xi = xs.get_at(i)
+                            let yi = ys.get_at(i)
+                            if not values_equal(xi, yi):
                                 eq = false
                             i = i + 1
                         eq
@@ -730,6 +774,7 @@ def void register_stdlib(mut Interpreter interp):
 
     env_define(env, "channel", Value.NativeFn("channel", Value.Nil), false)
     env_define(env, "drop", Value.NativeFn("drop", Value.Nil), false)
+    env_define(env, "despawn", Value.NativeFn("despawn", Value.Nil), false)
 
     # Result constructors: Ok(v) and Err(e)
     env_define(env, "Ok", Value.EnumVariant("Result", "Ok", []), false)
@@ -771,9 +816,11 @@ def Interpreter'actor new_interpreter():
         block_site = 0,
         declared_types = {},
         net = Sockets(listeners = {}, streams = {}, next_id = 0),
+        ecs = new_ecs_state(),
         return_ty_stack = [],
         last_var_params = [],
         search_paths = [],
+        deps = {},
         loaded_modules = []
     )
     register_stdlib(interp)
@@ -938,6 +985,15 @@ def string use_module_rel_path(UseDecl decl):
         i = i + 1
     rel + ".br"
 
+# `use dep.b.c` → sub-path `b/c.br` relative to dependency's `src/`
+def string use_sub_rel_path(UseDecl decl):
+    var string rel = decl.path[1]
+    var int i = 2
+    while i < decl.path.length:
+        rel = rel + "/" + decl.path[i]
+        i = i + 1
+    rel + ".br"
+
 # `use boring.collections.*` → repository-relative `stdlib/collections.br`.
 def string use_boring_stdlib_rel_path(UseDecl decl):
     var string rel = "stdlib"
@@ -963,16 +1019,27 @@ def void exec_use(mut Interpreter interp, UseDecl decl):
     if decl.path.length == 0:
         return
     let prefix = decl.path[0]
-    let rel = if prefix == "boring": use_boring_stdlib_rel_path(decl) else: use_module_rel_path(decl)
     var string? found = nil
-    if prefix == "boring" and fs.exists(rel):
-        found = rel
-    elif prefix == "boring" and fs.exists("boring/" + rel):
-        found = "boring/" + rel
+    if interp.has_dep(prefix):
+        if decl.path.length < 2:
+            return
+        if let dep_src = interp.get_dep(prefix):
+            let sub_rel = use_sub_rel_path(decl)
+            let candidate = use_join_path(dep_src.clone(), sub_rel.clone())
+            if not fs.exists(candidate):
+                error "cannot find '{sub_rel}' in dependency '{prefix}' (looked in {dep_src})"
+                exit(1)
+            found = candidate
     else:
-        found = interp.find_module_file(rel.clone())
-        if found == nil and prefix == "boring":
-            found = interp.find_module_file("boring/" + rel)
+        let rel = if prefix == "boring": use_boring_stdlib_rel_path(decl) else: use_module_rel_path(decl)
+        if prefix == "boring" and fs.exists(rel):
+            found = rel
+        elif prefix == "boring" and fs.exists("boring/" + rel):
+            found = "boring/" + rel
+        else:
+            found = interp.find_module_file(rel.clone())
+            if found == nil and prefix == "boring":
+                found = interp.find_module_file("boring/" + rel)
     guard let abs = found else:
         if prefix == "boring":
             error "unknown Boring standard library module '{decl.path.join(".")}'"
@@ -1194,9 +1261,16 @@ def void report_unhandled_exception(mut Interpreter interp, string context):
         exit(1)
 
 def void run_program(mut Interpreter interp, Program prog):
+    let uses_ecs = program_uses_ecs(prog)
+    if uses_ecs:
+        let has_entity = interp.get_struct_decl("Entity") != nil
+        if not has_entity:
+            exec_use(interp, UseDecl(path= ["boring", "ecs"], glob= true, items= [], line= 0))
     for item in prog.items:
         exec_item(interp, item)
         report_unhandled_exception(interp, "unhandled exception")
+    if uses_ecs:
+        init_ecs_resources(interp, prog)
     # Auto-invoke `main` after registering all top-level items, mirroring the
     # Rust interpreter's entry point — a `.br` program that only declares
     # `def main():` (the standard idiom) must actually run it.
@@ -1204,3 +1278,6 @@ def void run_program(mut Interpreter interp, Program prog):
     if let main_decl = main_decl_opt:
         _ = call_fn(interp, main_decl, [], nil)
         report_unhandled_exception(interp, "unhandled exception in main")
+    elif uses_ecs:
+        run_ecs_game_loop(interp, prog)
+        report_unhandled_exception(interp, "unhandled exception in ECS loop")
